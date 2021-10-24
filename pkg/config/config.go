@@ -43,15 +43,15 @@ type Config struct {
 	APIServerCA                     []byte            `json:"apiServerCA,omitempty"`
 	Bootstrap                       Bootstrap         `json:"bootstrap,omitempty"`
 	IgnoreClusterRegistrationLabels bool              `json:"ignoreClusterRegistrationLabels,omitempty"`
-	IgnoreAgentNamespaceCheck       bool              `json:"ignoreAgentNamespaceCheck,omitempty"`
 }
 
 type Bootstrap struct {
-	Namespace string `json:"namespace,omitempty"`
-	Repo      string `json:"repo,omitempty"`
-	Secret    string `json:"secret,omitempty"`
-	Paths     string `json:"paths,omitempty"`
-	Branch    string `json:"branch,omitempty"`
+	Namespace      string `json:"namespace,omitempty"`
+	AgentNamespace string `json:"agentNamespace,omitempty"`
+	Repo           string `json:"repo,omitempty"`
+	Secret         string `json:"secret,omitempty"`
+	Paths          string `json:"paths,omitempty"`
+	Branch         string `json:"branch,omitempty"`
 }
 
 func OnChange(ctx context.Context, f func(*Config) error) {
