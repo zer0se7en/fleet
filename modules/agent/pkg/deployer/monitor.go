@@ -2,41 +2,39 @@ package deployer
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
-	"strings"
 
-	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	"github.com/argoproj/argo-cd/util/argo"
-	"github.com/argoproj/gitops-engine/pkg/diff"
 	jsonpatch "github.com/evanphx/json-patch"
+
+	"github.com/pkg/errors"
+	"github.com/rancher/fleet/modules/agent/pkg/deployer/internal/diff"
+	"github.com/rancher/fleet/modules/agent/pkg/deployer/internal/diffnormalize"
+	"github.com/rancher/fleet/modules/agent/pkg/deployer/internal/resource"
 	fleetnorm "github.com/rancher/fleet/modules/agent/pkg/deployer/normalizers"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/rancher/fleet/pkg/helmdeployer"
 	"github.com/rancher/wrangler/pkg/apply"
 	"github.com/rancher/wrangler/pkg/merr"
-	"github.com/rancher/wrangler/pkg/name"
 	"github.com/rancher/wrangler/pkg/objectset"
 	"github.com/rancher/wrangler/pkg/summary"
+	"github.com/sirupsen/logrus"
+
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-type DeploymentStatus struct {
-	Ready          bool                   `json:"ready,omitempty"`
-	NonModified    bool                   `json:"nonModified,omitempty"`
-	NonReadyStatus []fleet.NonReadyStatus `json:"nonReadyStatus,omitempty"`
-	ModifiedStatus []fleet.ModifiedStatus `json:"modifiedStatus,omitempty"`
-}
-
+// plan first does a dry run of the apply to get the difference between the
+// desired and live state. It relies on the bundledeployment's bundle diff
+// patches to ignore changes.
 func (m *Manager) plan(bd *fleet.BundleDeployment, ns string, objs ...runtime.Object) (apply.Plan, error) {
 	if ns == "" {
 		ns = m.defaultNamespace
 	}
 
-	a, err := m.getApply(bd, ns)
-	if err != nil {
-		return apply.Plan{}, err
-	}
+	a := m.getApply(bd, ns)
 	plan, err := a.DryRun(objs...)
 	if err != nil {
 		return plan, err
@@ -100,7 +98,7 @@ func (m *Manager) plan(bd *fleet.BundleDeployment, ns string, objs ...runtime.Ob
 }
 
 func (m *Manager) normalizers(live objectset.ObjectByGVK, bd *fleet.BundleDeployment) (diff.Normalizer, error) {
-	var ignore []v1alpha1.ResourceIgnoreDifferences
+	var ignore []resource.ResourceIgnoreDifferences
 	jsonPatchNorm := &fleetnorm.JSONPatchNormalizer{}
 	if bd.Spec.Options.Diff != nil {
 		for _, patch := range bd.Spec.Options.Diff.ComparePatches {
@@ -108,7 +106,7 @@ func (m *Manager) normalizers(live objectset.ObjectByGVK, bd *fleet.BundleDeploy
 			if err != nil {
 				return nil, err
 			}
-			ignore = append(ignore, v1alpha1.ResourceIgnoreDifferences{
+			ignore = append(ignore, resource.ResourceIgnoreDifferences{
 				Namespace:    patch.Namespace,
 				Name:         patch.Name,
 				Kind:         patch.Kind,
@@ -132,7 +130,7 @@ func (m *Manager) normalizers(live objectset.ObjectByGVK, bd *fleet.BundleDeploy
 		}
 	}
 
-	ignoreNorm, err := argo.NewDiffNormalizer(ignore, nil)
+	ignoreNorm, err := diffnormalize.NewDiffNormalizer(ignore, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -141,61 +139,92 @@ func (m *Manager) normalizers(live objectset.ObjectByGVK, bd *fleet.BundleDeploy
 	return norm, nil
 }
 
-func (m *Manager) getApply(bd *fleet.BundleDeployment, ns string) (apply.Apply, error) {
+func (m *Manager) getApply(bd *fleet.BundleDeployment, ns string) apply.Apply {
 	apply := m.apply
 	return apply.
 		WithIgnorePreviousApplied().
-		WithSetID(GetSetID(bd.Name, m.labelPrefix, m.labelSuffix)).
-		WithDefaultNamespace(ns), nil
+		WithSetID(helmdeployer.GetSetID(bd.Name, m.labelPrefix, m.labelSuffix)).
+		WithDefaultNamespace(ns)
 }
 
-func (m *Manager) MonitorBundle(bd *fleet.BundleDeployment) (DeploymentStatus, error) {
-	var status DeploymentStatus
-
+// UpdateBundleDeploymentStatus updates the status with information from the
+// helm release history and an apply dry run.
+func (m *Manager) UpdateBundleDeploymentStatus(mapper meta.RESTMapper, bd *fleet.BundleDeployment) error {
 	resources, err := m.deployer.Resources(bd.Name, bd.Status.Release)
 	if err != nil {
-		return status, err
+		return err
+	}
+	resourcesPreviousRelease, err := m.deployer.ResourcesFromPreviousReleaseVersion(bd.Name, bd.Status.Release)
+	if err != nil {
+		return err
 	}
 
 	plan, err := m.plan(bd, resources.DefaultNamespace, resources.Objects...)
 	if err != nil {
-		return status, err
+		return err
 	}
 
-	status.NonReadyStatus = nonReady(plan)
-	status.ModifiedStatus = modified(plan)
-	status.Ready = false
-	status.NonModified = false
+	bd.Status.NonReadyStatus = nonReady(plan, bd.Spec.Options.IgnoreOptions)
+	bd.Status.ModifiedStatus = modified(plan, resourcesPreviousRelease)
+	bd.Status.Ready = false
+	bd.Status.NonModified = false
 
-	if len(status.NonReadyStatus) == 0 {
-		status.Ready = true
+	if len(bd.Status.NonReadyStatus) == 0 {
+		bd.Status.Ready = true
 	}
-	if len(status.ModifiedStatus) == 0 {
-		status.NonModified = true
+	if len(bd.Status.ModifiedStatus) == 0 {
+		bd.Status.NonModified = true
+	} else if bd.Spec.CorrectDrift.Enabled {
+		err = m.deployer.RemoveExternalChanges(bd)
+		if err != nil {
+			// Update BundleDeployment status as wrangler doesn't update the status if error is not nil.
+			_, errStatus := m.bundleDeploymentController.UpdateStatus(bd)
+			if errStatus != nil {
+				return errors.Wrap(err, "error updating status when reconciling drift: "+errStatus.Error())
+			}
+			return errors.Wrapf(err, "error reconciling drift")
+		}
 	}
 
-	return status, nil
+	bd.Status.Resources = []fleet.BundleDeploymentResource{}
+	for _, obj := range resources.Objects {
+		m, err := meta.Accessor(obj)
+		if err != nil {
+			return err
+		}
+
+		ns := m.GetNamespace()
+		gvk := obj.GetObjectKind().GroupVersionKind()
+		if ns == "" && isNamespaced(mapper, gvk) {
+			ns = resources.DefaultNamespace
+		}
+
+		version, kind := gvk.ToAPIVersionAndKind()
+		bd.Status.Resources = append(bd.Status.Resources, fleet.BundleDeploymentResource{
+			Kind:       kind,
+			APIVersion: version,
+			Namespace:  ns,
+			Name:       m.GetName(),
+			CreatedAt:  m.GetCreationTimestamp(),
+		})
+	}
+
+	return nil
 }
 
-func GetSetID(bundleID, labelPrefix, labelSuffix string) string {
-	// bundle is fleet-agent bundle, we need to use setID fleet-agent-bootstrap since it was applied with import controller
-	if strings.HasPrefix(bundleID, "fleet-agent") {
-		if labelSuffix == "" {
-			return "fleet-agent-bootstrap"
-		}
-		return name.SafeConcatName("fleet-agent-bootstrap", labelSuffix)
+func isNamespaced(mapper meta.RESTMapper, gvk schema.GroupVersionKind) bool {
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return true
 	}
-	if labelSuffix != "" {
-		return name.SafeConcatName(labelPrefix, bundleID, labelSuffix)
-	}
-	return name.SafeConcatName(labelPrefix, bundleID)
+	return mapping.Scope.Name() == meta.RESTScopeNameNamespace
 }
 
 func sortKey(f fleet.ModifiedStatus) string {
 	return f.APIVersion + "/" + f.Kind + "/" + f.Namespace + "/" + f.Name
 }
 
-func modified(plan apply.Plan) (result []fleet.ModifiedStatus) {
+func modified(plan apply.Plan, resourcesPreviousRelease *helmdeployer.Resources) (result []fleet.ModifiedStatus) {
 	defer func() {
 		sort.Slice(result, func(i, j int) bool {
 			return sortKey(result[i]) < sortKey(result[j])
@@ -225,13 +254,19 @@ func modified(plan apply.Plan) (result []fleet.ModifiedStatus) {
 			}
 
 			apiVersion, kind := gvk.ToAPIVersionAndKind()
-			result = append(result, fleet.ModifiedStatus{
-				Kind:       kind,
-				APIVersion: apiVersion,
-				Namespace:  key.Namespace,
-				Name:       key.Name,
-				Delete:     true,
-			})
+			// Check if resource was in a previous release. It is possible that some operators copy the
+			// objectset.rio.cattle.io/hash label into a dynamically created objects. We need to skip these resources
+			// because they are not part of the release, and they would appear as orphaned.
+			// https://github.com/rancher/fleet/issues/1141
+			if isResourceInPreviousRelease(key, kind, resourcesPreviousRelease.Objects) {
+				result = append(result, fleet.ModifiedStatus{
+					Kind:       kind,
+					APIVersion: apiVersion,
+					Namespace:  key.Namespace,
+					Name:       key.Name,
+					Delete:     true,
+				})
+			}
 		}
 	}
 
@@ -252,10 +287,21 @@ func modified(plan apply.Plan) (result []fleet.ModifiedStatus) {
 		}
 	}
 
-	return
+	return result
 }
 
-func nonReady(plan apply.Plan) (result []fleet.NonReadyStatus) {
+func isResourceInPreviousRelease(key objectset.ObjectKey, kind string, objsPreviousRelease []runtime.Object) bool {
+	for _, obj := range objsPreviousRelease {
+		metadata, _ := meta.Accessor(obj)
+		if obj.GetObjectKind().GroupVersionKind().Kind == kind && metadata.GetName() == key.Name {
+			return true
+		}
+	}
+
+	return false
+}
+
+func nonReady(plan apply.Plan, ignoreOptions fleet.IgnoreOptions) (result []fleet.NonReadyStatus) {
 	defer func() {
 		sort.Slice(result, func(i, j int) bool {
 			return result[i].UID < result[j].UID
@@ -267,6 +313,12 @@ func nonReady(plan apply.Plan) (result []fleet.NonReadyStatus) {
 			return
 		}
 		if u, ok := obj.(*unstructured.Unstructured); ok {
+			if ignoreOptions.Conditions != nil {
+				if err := excludeIgnoredConditions(u, ignoreOptions); err != nil {
+					logrus.Errorf("failed to ignore conditions: %v", err)
+				}
+			}
+
 			summary := summary.Summarize(u)
 			if !summary.IsReady() {
 				result = append(result, fleet.NonReadyStatus{
@@ -281,5 +333,53 @@ func nonReady(plan apply.Plan) (result []fleet.NonReadyStatus) {
 		}
 	}
 
-	return
+	return result
+}
+
+// excludeIgnoredConditions removes the conditions that are included in ignoreOptions from the object passed as a parameter
+func excludeIgnoredConditions(obj *unstructured.Unstructured, ignoreOptions fleet.IgnoreOptions) error {
+	conditions, _, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil {
+		return err
+	}
+	conditionsWithoutIgnored := make([]interface{}, 0)
+
+	for _, condition := range conditions {
+		condition, ok := condition.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("condition: %#v can't be converted to map[string]interface{}", condition)
+		}
+		excludeCondition := false
+		for _, ignoredCondition := range ignoreOptions.Conditions {
+			if shouldExcludeCondition(condition, ignoredCondition) {
+				excludeCondition = true
+				break
+			}
+		}
+		if !excludeCondition {
+			conditionsWithoutIgnored = append(conditionsWithoutIgnored, condition)
+		}
+	}
+
+	err = unstructured.SetNestedSlice(obj.Object, conditionsWithoutIgnored, "status", "conditions")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// shouldExcludeCondition returns true if all the elements of ignoredConditions are inside conditions
+func shouldExcludeCondition(conditions map[string]interface{}, ignoredConditions map[string]string) bool {
+	if len(ignoredConditions) > len(conditions) {
+		return false
+	}
+
+	for k, v := range ignoredConditions {
+		if vc, found := conditions[k]; !found || vc != v {
+			return false
+		}
+	}
+
+	return true
 }

@@ -1,3 +1,4 @@
+// Package image registers a controller for image scans. (fleetcontroller)
 package image
 
 import (
@@ -6,8 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,13 +26,17 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/rancher/fleet/pkg/durations"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/update"
+
 	"github.com/rancher/wrangler/pkg/condition"
-	corev1controler "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	corev1controller "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/pkg/kstatus"
-	"github.com/sirupsen/logrus"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -41,7 +46,7 @@ import (
 var (
 	lock sync.Mutex
 
-	defaultInterval = time.Minute * 15
+	defaultInterval = durations.DefaultImageInterval
 )
 
 const (
@@ -57,7 +62,7 @@ const (
 	imageSyncCond = "ImageSynced"
 )
 
-func Register(ctx context.Context, core corev1controler.Interface, gitRepos fleetcontrollers.GitRepoController, images fleetcontrollers.ImageScanController) {
+func Register(ctx context.Context, core corev1controller.Interface, gitRepos fleetcontrollers.GitRepoController, images fleetcontrollers.ImageScanController) {
 	h := handler{
 		ctx:         ctx,
 		secretCache: core.Secret().Cache(),
@@ -72,7 +77,7 @@ func Register(ctx context.Context, core corev1controler.Interface, gitRepos flee
 
 type handler struct {
 	ctx         context.Context
-	secretCache corev1controler.SecretCache
+	secretCache corev1controller.SecretCache
 	gitrepos    fleetcontrollers.GitRepoController
 	imagescans  fleetcontrollers.ImageScanController
 }
@@ -116,7 +121,7 @@ func (h handler) onChange(image *v1alpha1.ImageScan, status v1alpha1.ImageScanSt
 		options = append(options, remote.WithAuth(auth))
 	}
 
-	tags, err := remote.ListWithContext(h.ctx, ref.Context(), options...)
+	tags, err := remote.List(ref.Context(), append(options, remote.WithContext(h.ctx))...)
 	if err != nil {
 		kstatus.SetError(image, err.Error())
 		return status, err
@@ -170,6 +175,7 @@ func (h handler) onChangeGitRepo(gitrepo *v1alpha1.GitRepo, status v1alpha1.GitR
 	if gitrepo == nil || gitrepo.DeletionTimestamp != nil {
 		return status, nil
 	}
+	logrus.Debugf("onChangeGitRepo: gitrepo %s/%s changed, checking for image scans", gitrepo.Namespace, gitrepo.Name)
 
 	imagescans, err := h.imagescans.Cache().List(gitrepo.Namespace, labels.Everything())
 	if err != nil {
@@ -206,10 +212,14 @@ func (h handler) onChangeGitRepo(gitrepo *v1alpha1.GitRepo, status v1alpha1.GitR
 		return status, nil
 	}
 
+	logrus.Debugf("onChangeGitRepo: gitrepo %s/%s changed, syncing repo for image scans", gitrepo.Namespace, gitrepo.Name)
+
+	// This lock is required to prevent conflicts while using the environment variable SSH_KNOWN_HOSTS.
+	// It was added before the SSH support so there might be other potential conflicts without it.
 	lock.Lock()
 	defer lock.Unlock()
 	// todo: maybe we should preserve the dir
-	tmp, err := ioutil.TempDir("", fmt.Sprintf("%s-%s", gitrepo.Namespace, gitrepo.Name))
+	tmp, err := os.MkdirTemp("", fmt.Sprintf("%s-%s", gitrepo.Namespace, gitrepo.Name))
 	if err != nil {
 		kstatus.SetError(gitrepo, err.Error())
 		return status, err
@@ -220,6 +230,14 @@ func (h handler) onChangeGitRepo(gitrepo *v1alpha1.GitRepo, status v1alpha1.GitR
 	if err != nil {
 		kstatus.SetError(gitrepo, err.Error())
 		return status, err
+	}
+
+	// Remove SSH known_hosts tmpdir unless it was provided by the user
+	if os.Getenv("SSH_KNOWN_HOSTS") != "" {
+		tmpdir := filepath.Dir(os.Getenv("SSH_KNOWN_HOSTS"))
+		if strings.HasPrefix(tmpdir, "/tmp/"+fmt.Sprintf("ssh-%s-%s-", gitrepo.Namespace, gitrepo.Name)) {
+			defer os.RemoveAll(tmpdir)
+		}
 	}
 
 	repo, err := gogit.PlainClone(tmp, false, &gogit.CloneOptions{
@@ -237,7 +255,14 @@ func (h handler) onChangeGitRepo(gitrepo *v1alpha1.GitRepo, status v1alpha1.GitR
 		return status, err
 	}
 
-	for _, path := range gitrepo.Spec.Paths {
+	// Checking if paths field is empty
+	// if yes, using the default value "/"
+	paths := gitrepo.Spec.Paths
+	if len(paths) == 0 {
+		paths = []string{"/"}
+	}
+
+	for _, path := range paths {
 		updatePath := filepath.Join(tmp, path)
 		if err := update.WithSetters(updatePath, updatePath, scans); err != nil {
 			kstatus.SetError(gitrepo, err.Error())
@@ -264,6 +289,32 @@ func (h handler) onChangeGitRepo(gitrepo *v1alpha1.GitRepo, status v1alpha1.GitR
 	return status, err
 }
 
+func setupKnownHosts(gitrepo *v1alpha1.GitRepo, data []byte) error {
+	tmpdir, err := os.MkdirTemp("", fmt.Sprintf("ssh-%s-%s-", gitrepo.Namespace, gitrepo.Name))
+	if err != nil {
+		return err
+	}
+
+	known := path.Join(tmpdir, "known_hosts")
+	err = os.Setenv("SSH_KNOWN_HOSTS", known)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Create(known)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = file.Write(data)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func shouldSync(gitrepo *v1alpha1.GitRepo) bool {
 	interval := gitrepo.Spec.ImageSyncInterval
 	if interval == nil || interval.Seconds() == 0.0 {
@@ -272,7 +323,7 @@ func shouldSync(gitrepo *v1alpha1.GitRepo) bool {
 		}
 	}
 
-	if time.Now().Sub(gitrepo.Status.LastSyncedImageScanTime.Time) < interval.Duration {
+	if time.Since(gitrepo.Status.LastSyncedImageScanTime.Time) < interval.Duration {
 		return false
 	}
 	return true
@@ -338,6 +389,16 @@ func (h handler) auth(gitrepo *v1alpha1.GitRepo) (transport.AuthMethod, error) {
 			Password: string(secret.Data[corev1.BasicAuthPasswordKey]),
 		}, nil
 	case corev1.SecretTypeSSHAuth:
+		knownHosts := secret.Data["known_hosts"]
+		if knownHosts == nil {
+			logrus.Infof("The git secret `%s` does not have a known_hosts field, so no host key verification possible!", gitrepo.Spec.ClientSecretName)
+		} else {
+			err := setupKnownHosts(gitrepo, knownHosts)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		publicKey, err := ssh.NewPublicKeys("git", secret.Data[corev1.SSHAuthPrivateKey], "")
 		if err != nil {
 			return nil, err
@@ -381,7 +442,7 @@ func shouldScan(image *v1alpha1.ImageScan) bool {
 		return true
 	}
 
-	if time.Now().Sub(image.Status.LastScanTime.Time) < interval.Duration {
+	if time.Since(image.Status.LastScanTime.Time) < interval.Duration {
 		return false
 	}
 	return true
@@ -423,7 +484,7 @@ func latestTag(policy v1alpha1.ImagePolicyChoice, versions []string) (string, er
 }
 
 func semverLatest(r string, versions []string) (string, error) {
-	contraints, err := semver.NewConstraint(r)
+	constraints, err := semver.NewConstraint(r)
 	if err != nil {
 		return "", err
 	}
@@ -431,7 +492,7 @@ func semverLatest(r string, versions []string) (string, error) {
 	for _, version := range versions {
 		if ver, err := semver.NewVersion(version); err == nil {
 			if latestVersion == nil || ver.GreaterThan(latestVersion) {
-				if contraints.Check(ver) {
+				if constraints.Check(ver) {
 					latestVersion = ver
 				}
 			}

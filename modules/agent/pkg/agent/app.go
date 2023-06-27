@@ -1,3 +1,4 @@
+// Package agent provides the agent controller. (fleetagent)
 package agent
 
 import (
@@ -7,10 +8,12 @@ import (
 
 	"github.com/rancher/fleet/modules/agent/pkg/controllers"
 	"github.com/rancher/fleet/modules/agent/pkg/register"
+
 	"github.com/rancher/lasso/pkg/mapper"
 	"github.com/rancher/wrangler/pkg/kubeconfig"
 	"github.com/rancher/wrangler/pkg/ratelimit"
 	"github.com/rancher/wrangler/pkg/ticker"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -22,23 +25,10 @@ import (
 type Options struct {
 	DefaultNamespace string
 	ClusterID        string
-	NoLeaderElect    bool
 	CheckinInterval  time.Duration
-	StartAfter       <-chan struct{}
 }
 
-func Register(ctx context.Context, kubeConfig, namespace, clusterID string) error {
-	clientConfig := kubeconfig.GetNonInteractiveClientConfig(kubeConfig)
-	kc, err := clientConfig.ClientConfig()
-	if err != nil {
-		return err
-	}
-	kc.RateLimiter = ratelimit.None
-
-	_, err = register.Register(ctx, namespace, clusterID, kc)
-	return err
-}
-
+// Start the fleet agent
 func Start(ctx context.Context, kubeConfig, namespace, agentScope string, opts *Options) error {
 	if opts == nil {
 		opts = &Options{}
@@ -74,7 +64,6 @@ func Start(ctx context.Context, kubeConfig, namespace, agentScope string, opts *
 	}
 
 	return controllers.Register(ctx,
-		!opts.NoLeaderElect,
 		fleetNamespace,
 		namespace,
 		opts.DefaultNamespace,
@@ -86,8 +75,7 @@ func Start(ctx context.Context, kubeConfig, namespace, agentScope string, opts *
 		clientConfig,
 		fleetMapper,
 		mapper,
-		discovery,
-		opts.StartAfter)
+		discovery)
 }
 
 var (

@@ -70,6 +70,9 @@ spec:
                   backoffLimit:
                     nullable: true
                     type: integer
+                  completionMode:
+                    nullable: true
+                    type: string
                   completions:
                     nullable: true
                     type: integer
@@ -79,6 +82,46 @@ spec:
                   parallelism:
                     nullable: true
                     type: integer
+                  podFailurePolicy:
+                    nullable: true
+                    properties:
+                      rules:
+                        items:
+                          properties:
+                            action:
+                              nullable: true
+                              type: string
+                            onExitCodes:
+                              nullable: true
+                              properties:
+                                containerName:
+                                  nullable: true
+                                  type: string
+                                operator:
+                                  nullable: true
+                                  type: string
+                                values:
+                                  items:
+                                    type: integer
+                                  nullable: true
+                                  type: array
+                              type: object
+                            onPodConditions:
+                              items:
+                                properties:
+                                  status:
+                                    nullable: true
+                                    type: string
+                                  type:
+                                    nullable: true
+                                    type: string
+                                type: object
+                              nullable: true
+                              type: array
+                          type: object
+                        nullable: true
+                        type: array
+                    type: object
                   selector:
                     nullable: true
                     properties:
@@ -107,6 +150,9 @@ spec:
                         nullable: true
                         type: object
                     type: object
+                  suspend:
+                    nullable: true
+                    type: boolean
                   template:
                     properties:
                       metadata:
@@ -117,9 +163,6 @@ spec:
                               type: string
                             nullable: true
                             type: object
-                          clusterName:
-                            nullable: true
-                            type: string
                           creationTimestamp:
                             nullable: true
                             type: string
@@ -162,6 +205,9 @@ spec:
                                   nullable: true
                                   type: string
                                 operation:
+                                  nullable: true
+                                  type: string
+                                subresource:
                                   nullable: true
                                   type: string
                                 time:
@@ -351,6 +397,34 @@ spec:
                                                   nullable: true
                                                   type: object
                                               type: object
+                                            namespaceSelector:
+                                              nullable: true
+                                              properties:
+                                                matchExpressions:
+                                                  items:
+                                                    properties:
+                                                      key:
+                                                        nullable: true
+                                                        type: string
+                                                      operator:
+                                                        nullable: true
+                                                        type: string
+                                                      values:
+                                                        items:
+                                                          nullable: true
+                                                          type: string
+                                                        nullable: true
+                                                        type: array
+                                                    type: object
+                                                  nullable: true
+                                                  type: array
+                                                matchLabels:
+                                                  additionalProperties:
+                                                    nullable: true
+                                                    type: string
+                                                  nullable: true
+                                                  type: object
+                                              type: object
                                             namespaces:
                                               items:
                                                 nullable: true
@@ -370,6 +444,34 @@ spec:
                                     items:
                                       properties:
                                         labelSelector:
+                                          nullable: true
+                                          properties:
+                                            matchExpressions:
+                                              items:
+                                                properties:
+                                                  key:
+                                                    nullable: true
+                                                    type: string
+                                                  operator:
+                                                    nullable: true
+                                                    type: string
+                                                  values:
+                                                    items:
+                                                      nullable: true
+                                                      type: string
+                                                    nullable: true
+                                                    type: array
+                                                type: object
+                                              nullable: true
+                                              type: array
+                                            matchLabels:
+                                              additionalProperties:
+                                                nullable: true
+                                                type: string
+                                              nullable: true
+                                              type: object
+                                          type: object
+                                        namespaceSelector:
                                           nullable: true
                                           properties:
                                             matchExpressions:
@@ -446,6 +548,34 @@ spec:
                                                   nullable: true
                                                   type: object
                                               type: object
+                                            namespaceSelector:
+                                              nullable: true
+                                              properties:
+                                                matchExpressions:
+                                                  items:
+                                                    properties:
+                                                      key:
+                                                        nullable: true
+                                                        type: string
+                                                      operator:
+                                                        nullable: true
+                                                        type: string
+                                                      values:
+                                                        items:
+                                                          nullable: true
+                                                          type: string
+                                                        nullable: true
+                                                        type: array
+                                                    type: object
+                                                  nullable: true
+                                                  type: array
+                                                matchLabels:
+                                                  additionalProperties:
+                                                    nullable: true
+                                                    type: string
+                                                  nullable: true
+                                                  type: object
+                                              type: object
                                             namespaces:
                                               items:
                                                 nullable: true
@@ -465,6 +595,34 @@ spec:
                                     items:
                                       properties:
                                         labelSelector:
+                                          nullable: true
+                                          properties:
+                                            matchExpressions:
+                                              items:
+                                                properties:
+                                                  key:
+                                                    nullable: true
+                                                    type: string
+                                                  operator:
+                                                    nullable: true
+                                                    type: string
+                                                  values:
+                                                    items:
+                                                      nullable: true
+                                                      type: string
+                                                    nullable: true
+                                                    type: array
+                                                type: object
+                                              nullable: true
+                                              type: array
+                                            matchLabels:
+                                              additionalProperties:
+                                                nullable: true
+                                                type: string
+                                              nullable: true
+                                              type: object
+                                          type: object
+                                        namespaceSelector:
                                           nullable: true
                                           properties:
                                             matchExpressions:
@@ -747,6 +905,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -791,6 +958,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -831,6 +1001,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -875,6 +1054,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -968,6 +1150,9 @@ spec:
                                         gmsaCredentialSpecName:
                                           nullable: true
                                           type: string
+                                        hostProcess:
+                                          nullable: true
+                                          type: boolean
                                         runAsUserName:
                                           nullable: true
                                           type: string
@@ -988,6 +1173,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -1032,6 +1226,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -1360,6 +1557,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -1404,6 +1610,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -1444,6 +1653,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -1488,6 +1706,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -1581,6 +1802,9 @@ spec:
                                         gmsaCredentialSpecName:
                                           nullable: true
                                           type: string
+                                        hostProcess:
+                                          nullable: true
+                                          type: boolean
                                         runAsUserName:
                                           nullable: true
                                           type: string
@@ -1601,6 +1825,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -1645,6 +1878,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -1724,6 +1960,9 @@ spec:
                           hostNetwork:
                             type: boolean
                           hostPID:
+                            type: boolean
+                          hostUsers:
+                            nullable: true
                             type: boolean
                           hostname:
                             nullable: true
@@ -1975,6 +2214,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -2019,6 +2267,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -2059,6 +2310,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -2103,6 +2363,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -2196,6 +2459,9 @@ spec:
                                         gmsaCredentialSpecName:
                                           nullable: true
                                           type: string
+                                        hostProcess:
+                                          nullable: true
+                                          type: boolean
                                         runAsUserName:
                                           nullable: true
                                           type: string
@@ -2216,6 +2482,15 @@ spec:
                                       type: object
                                     failureThreshold:
                                       type: integer
+                                    grpc:
+                                      nullable: true
+                                      properties:
+                                        port:
+                                          type: integer
+                                        service:
+                                          nullable: true
+                                          type: string
+                                      type: object
                                     httpGet:
                                       nullable: true
                                       properties:
@@ -2260,6 +2535,9 @@ spec:
                                           nullable: true
                                           type: string
                                       type: object
+                                    terminationGracePeriodSeconds:
+                                      nullable: true
+                                      type: integer
                                     timeoutSeconds:
                                       type: integer
                                   type: object
@@ -2324,6 +2602,13 @@ spec:
                               nullable: true
                               type: string
                             nullable: true
+                            type: object
+                          os:
+                            nullable: true
+                            properties:
+                              name:
+                                nullable: true
+                                type: string
                             type: object
                           overhead:
                             additionalProperties:
@@ -2428,6 +2713,9 @@ spec:
                                   gmsaCredentialSpecName:
                                     nullable: true
                                     type: string
+                                  hostProcess:
+                                    nullable: true
+                                    type: boolean
                                   runAsUserName:
                                     nullable: true
                                     type: string
@@ -2503,8 +2791,23 @@ spec:
                                       nullable: true
                                       type: object
                                   type: object
+                                matchLabelKeys:
+                                  items:
+                                    nullable: true
+                                    type: string
+                                  nullable: true
+                                  type: array
                                 maxSkew:
                                   type: integer
+                                minDomains:
+                                  nullable: true
+                                  type: integer
+                                nodeAffinityPolicy:
+                                  nullable: true
+                                  type: string
+                                nodeTaintsPolicy:
+                                  nullable: true
+                                  type: string
                                 topologyKey:
                                   nullable: true
                                   type: string
@@ -2721,8 +3024,6 @@ spec:
                                 ephemeral:
                                   nullable: true
                                   properties:
-                                    readOnly:
-                                      type: boolean
                                     volumeClaimTemplate:
                                       nullable: true
                                       properties:
@@ -2734,9 +3035,6 @@ spec:
                                                 type: string
                                               nullable: true
                                               type: object
-                                            clusterName:
-                                              nullable: true
-                                              type: string
                                             creationTimestamp:
                                               nullable: true
                                               type: string
@@ -2779,6 +3077,9 @@ spec:
                                                     nullable: true
                                                     type: string
                                                   operation:
+                                                    nullable: true
+                                                    type: string
+                                                  subresource:
                                                     nullable: true
                                                     type: string
                                                   time:
@@ -2836,6 +3137,19 @@ spec:
                                               nullable: true
                                               type: array
                                             dataSource:
+                                              nullable: true
+                                              properties:
+                                                apiGroup:
+                                                  nullable: true
+                                                  type: string
+                                                kind:
+                                                  nullable: true
+                                                  type: string
+                                                name:
+                                                  nullable: true
+                                                  type: string
+                                              type: object
+                                            dataSourceRef:
                                               nullable: true
                                               properties:
                                                 apiGroup:
@@ -3510,6 +3824,9 @@ spec:
                 backoffLimit:
                   nullable: true
                   type: integer
+                completionMode:
+                  nullable: true
+                  type: string
                 completions:
                   nullable: true
                   type: integer
@@ -3519,6 +3836,46 @@ spec:
                 parallelism:
                   nullable: true
                   type: integer
+                podFailurePolicy:
+                  nullable: true
+                  properties:
+                    rules:
+                      items:
+                        properties:
+                          action:
+                            nullable: true
+                            type: string
+                          onExitCodes:
+                            nullable: true
+                            properties:
+                              containerName:
+                                nullable: true
+                                type: string
+                              operator:
+                                nullable: true
+                                type: string
+                              values:
+                                items:
+                                  type: integer
+                                nullable: true
+                                type: array
+                            type: object
+                          onPodConditions:
+                            items:
+                              properties:
+                                status:
+                                  nullable: true
+                                  type: string
+                                type:
+                                  nullable: true
+                                  type: string
+                              type: object
+                            nullable: true
+                            type: array
+                        type: object
+                      nullable: true
+                      type: array
+                  type: object
                 selector:
                   nullable: true
                   properties:
@@ -3547,6 +3904,9 @@ spec:
                       nullable: true
                       type: object
                   type: object
+                suspend:
+                  nullable: true
+                  type: boolean
                 template:
                   properties:
                     metadata:
@@ -3557,9 +3917,6 @@ spec:
                             type: string
                           nullable: true
                           type: object
-                        clusterName:
-                          nullable: true
-                          type: string
                         creationTimestamp:
                           nullable: true
                           type: string
@@ -3602,6 +3959,9 @@ spec:
                                 nullable: true
                                 type: string
                               operation:
+                                nullable: true
+                                type: string
+                              subresource:
                                 nullable: true
                                 type: string
                               time:
@@ -3791,6 +4151,34 @@ spec:
                                                 nullable: true
                                                 type: object
                                             type: object
+                                          namespaceSelector:
+                                            nullable: true
+                                            properties:
+                                              matchExpressions:
+                                                items:
+                                                  properties:
+                                                    key:
+                                                      nullable: true
+                                                      type: string
+                                                    operator:
+                                                      nullable: true
+                                                      type: string
+                                                    values:
+                                                      items:
+                                                        nullable: true
+                                                        type: string
+                                                      nullable: true
+                                                      type: array
+                                                  type: object
+                                                nullable: true
+                                                type: array
+                                              matchLabels:
+                                                additionalProperties:
+                                                  nullable: true
+                                                  type: string
+                                                nullable: true
+                                                type: object
+                                            type: object
                                           namespaces:
                                             items:
                                               nullable: true
@@ -3810,6 +4198,34 @@ spec:
                                   items:
                                     properties:
                                       labelSelector:
+                                        nullable: true
+                                        properties:
+                                          matchExpressions:
+                                            items:
+                                              properties:
+                                                key:
+                                                  nullable: true
+                                                  type: string
+                                                operator:
+                                                  nullable: true
+                                                  type: string
+                                                values:
+                                                  items:
+                                                    nullable: true
+                                                    type: string
+                                                  nullable: true
+                                                  type: array
+                                              type: object
+                                            nullable: true
+                                            type: array
+                                          matchLabels:
+                                            additionalProperties:
+                                              nullable: true
+                                              type: string
+                                            nullable: true
+                                            type: object
+                                        type: object
+                                      namespaceSelector:
                                         nullable: true
                                         properties:
                                           matchExpressions:
@@ -3886,6 +4302,34 @@ spec:
                                                 nullable: true
                                                 type: object
                                             type: object
+                                          namespaceSelector:
+                                            nullable: true
+                                            properties:
+                                              matchExpressions:
+                                                items:
+                                                  properties:
+                                                    key:
+                                                      nullable: true
+                                                      type: string
+                                                    operator:
+                                                      nullable: true
+                                                      type: string
+                                                    values:
+                                                      items:
+                                                        nullable: true
+                                                        type: string
+                                                      nullable: true
+                                                      type: array
+                                                  type: object
+                                                nullable: true
+                                                type: array
+                                              matchLabels:
+                                                additionalProperties:
+                                                  nullable: true
+                                                  type: string
+                                                nullable: true
+                                                type: object
+                                            type: object
                                           namespaces:
                                             items:
                                               nullable: true
@@ -3905,6 +4349,34 @@ spec:
                                   items:
                                     properties:
                                       labelSelector:
+                                        nullable: true
+                                        properties:
+                                          matchExpressions:
+                                            items:
+                                              properties:
+                                                key:
+                                                  nullable: true
+                                                  type: string
+                                                operator:
+                                                  nullable: true
+                                                  type: string
+                                                values:
+                                                  items:
+                                                    nullable: true
+                                                    type: string
+                                                  nullable: true
+                                                  type: array
+                                              type: object
+                                            nullable: true
+                                            type: array
+                                          matchLabels:
+                                            additionalProperties:
+                                              nullable: true
+                                              type: string
+                                            nullable: true
+                                            type: object
+                                        type: object
+                                      namespaceSelector:
                                         nullable: true
                                         properties:
                                           matchExpressions:
@@ -4187,6 +4659,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -4231,6 +4712,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -4271,6 +4755,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -4315,6 +4808,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -4408,6 +4904,9 @@ spec:
                                       gmsaCredentialSpecName:
                                         nullable: true
                                         type: string
+                                      hostProcess:
+                                        nullable: true
+                                        type: boolean
                                       runAsUserName:
                                         nullable: true
                                         type: string
@@ -4428,6 +4927,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -4472,6 +4980,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -4800,6 +5311,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -4844,6 +5364,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -4884,6 +5407,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -4928,6 +5460,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -5021,6 +5556,9 @@ spec:
                                       gmsaCredentialSpecName:
                                         nullable: true
                                         type: string
+                                      hostProcess:
+                                        nullable: true
+                                        type: boolean
                                       runAsUserName:
                                         nullable: true
                                         type: string
@@ -5041,6 +5579,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -5085,6 +5632,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -5164,6 +5714,9 @@ spec:
                         hostNetwork:
                           type: boolean
                         hostPID:
+                          type: boolean
+                        hostUsers:
+                          nullable: true
                           type: boolean
                         hostname:
                           nullable: true
@@ -5415,6 +5968,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -5459,6 +6021,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -5499,6 +6064,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -5543,6 +6117,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -5636,6 +6213,9 @@ spec:
                                       gmsaCredentialSpecName:
                                         nullable: true
                                         type: string
+                                      hostProcess:
+                                        nullable: true
+                                        type: boolean
                                       runAsUserName:
                                         nullable: true
                                         type: string
@@ -5656,6 +6236,15 @@ spec:
                                     type: object
                                   failureThreshold:
                                     type: integer
+                                  grpc:
+                                    nullable: true
+                                    properties:
+                                      port:
+                                        type: integer
+                                      service:
+                                        nullable: true
+                                        type: string
+                                    type: object
                                   httpGet:
                                     nullable: true
                                     properties:
@@ -5700,6 +6289,9 @@ spec:
                                         nullable: true
                                         type: string
                                     type: object
+                                  terminationGracePeriodSeconds:
+                                    nullable: true
+                                    type: integer
                                   timeoutSeconds:
                                     type: integer
                                 type: object
@@ -5764,6 +6356,13 @@ spec:
                             nullable: true
                             type: string
                           nullable: true
+                          type: object
+                        os:
+                          nullable: true
+                          properties:
+                            name:
+                              nullable: true
+                              type: string
                           type: object
                         overhead:
                           additionalProperties:
@@ -5868,6 +6467,9 @@ spec:
                                 gmsaCredentialSpecName:
                                   nullable: true
                                   type: string
+                                hostProcess:
+                                  nullable: true
+                                  type: boolean
                                 runAsUserName:
                                   nullable: true
                                   type: string
@@ -5943,8 +6545,23 @@ spec:
                                     nullable: true
                                     type: object
                                 type: object
+                              matchLabelKeys:
+                                items:
+                                  nullable: true
+                                  type: string
+                                nullable: true
+                                type: array
                               maxSkew:
                                 type: integer
+                              minDomains:
+                                nullable: true
+                                type: integer
+                              nodeAffinityPolicy:
+                                nullable: true
+                                type: string
+                              nodeTaintsPolicy:
+                                nullable: true
+                                type: string
                               topologyKey:
                                 nullable: true
                                 type: string
@@ -6161,8 +6778,6 @@ spec:
                               ephemeral:
                                 nullable: true
                                 properties:
-                                  readOnly:
-                                    type: boolean
                                   volumeClaimTemplate:
                                     nullable: true
                                     properties:
@@ -6174,9 +6789,6 @@ spec:
                                               type: string
                                             nullable: true
                                             type: object
-                                          clusterName:
-                                            nullable: true
-                                            type: string
                                           creationTimestamp:
                                             nullable: true
                                             type: string
@@ -6219,6 +6831,9 @@ spec:
                                                   nullable: true
                                                   type: string
                                                 operation:
+                                                  nullable: true
+                                                  type: string
+                                                subresource:
                                                   nullable: true
                                                   type: string
                                                 time:
@@ -6276,6 +6891,19 @@ spec:
                                             nullable: true
                                             type: array
                                           dataSource:
+                                            nullable: true
+                                            properties:
+                                              apiGroup:
+                                                nullable: true
+                                                type: string
+                                              kind:
+                                                nullable: true
+                                                type: string
+                                              name:
+                                                nullable: true
+                                                type: string
+                                            type: object
+                                          dataSourceRef:
                                             nullable: true
                                             properties:
                                               apiGroup:

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -31,7 +32,7 @@ func TestValuesFrom(t *testing.T) {
 
 	configMapName := "configmap-name"
 	configMapNamespace := "configmap-namespace"
-	configMapValues, err := processValuesFromObject(configMapName, configMapNamespace, key, nil, &corev1.ConfigMap{
+	configMapValues, err := valuesFromConfigMap(configMapName, configMapNamespace, key, &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      configMapName,
 			Namespace: configMapNamespace,
@@ -44,7 +45,7 @@ func TestValuesFrom(t *testing.T) {
 
 	secretName := "secret-name"
 	secretNamespace := "secret-namespace"
-	secretValues, err := processValuesFromObject(secretName, secretNamespace, key, &corev1.Secret{
+	secretValues, err := valuesFromSecret(secretName, secretNamespace, key, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,
 			Namespace: secretNamespace,
@@ -52,7 +53,7 @@ func TestValuesFrom(t *testing.T) {
 		Data: map[string][]byte{
 			key: []byte(secretPayload),
 		},
-	}, nil)
+	})
 	a.NoError(err)
 
 	totalValues = mergeValues(totalValues, secretValues)

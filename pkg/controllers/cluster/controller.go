@@ -1,19 +1,22 @@
+// Package cluster provides controllers for managing clusters: status changes, importing, bootstrapping. (fleetcontroller)
 package cluster
 
 import (
 	"context"
 	"sort"
-	"time"
+
+	"github.com/sirupsen/logrus"
 
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/controllers/clusterregistration"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/summary"
+
 	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/pkg/kv"
 	"github.com/rancher/wrangler/pkg/name"
 	"github.com/rancher/wrangler/pkg/relatedresource"
-	"github.com/sirupsen/logrus"
+
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,7 +71,8 @@ func Register(ctx context.Context,
 
 func (h *handler) ensureNSDeleted(key string, obj *fleet.Cluster) (*fleet.Cluster, error) {
 	if obj == nil {
-		h.namespaces.Enqueue(clusterToNamespace(kv.Split(key, "/")))
+		logrus.Debugf("Cluster %s deleted, enqueue cluster namespace deletion", key)
+		h.namespaces.Enqueue(clusterNamespace(kv.Split(key, "/")))
 	}
 	return obj, nil
 }
@@ -89,6 +93,7 @@ func (h *handler) findClusters(namespaces corecontrollers.NamespaceCache) relate
 		if clusterNS == "" || clusterName == "" {
 			return nil, nil
 		}
+		logrus.Debugf("Enqueueing cluster %s/%s for bundledeployment %s/%s", clusterNS, clusterName, namespace, obj.(*fleet.BundleDeployment).Name)
 		return []relatedresource.Key{
 			{
 				Namespace: clusterNS,
@@ -98,7 +103,10 @@ func (h *handler) findClusters(namespaces corecontrollers.NamespaceCache) relate
 	}
 }
 
-func clusterToNamespace(clusterNamespace, clusterName string) string {
+// clusterNamespace returns the cluster namespace name
+// for a given cluster name, e.g.:
+// "cluster-fleet-local-cluster-294db1acfa77-d9ccf852678f"
+func clusterNamespace(clusterNamespace, clusterName string) string {
 	return name.SafeConcatName("cluster",
 		clusterNamespace,
 		clusterName,
@@ -106,6 +114,7 @@ func clusterToNamespace(clusterNamespace, clusterName string) string {
 }
 
 func (h *handler) OnClusterChanged(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, error) {
+	logrus.Debugf("OnClusterChanged for cluster status %s, checking cluster registration, updating status from bundledeployments, gitrepos", cluster.Name)
 	if cluster.DeletionTimestamp != nil {
 		clusterRegistrations, err := h.clusterRegistrations.List(cluster.Namespace, metav1.ListOptions{})
 		if err != nil {
@@ -125,7 +134,7 @@ func (h *handler) OnClusterChanged(cluster *fleet.Cluster, status fleet.ClusterS
 	}
 
 	if status.Namespace == "" {
-		status.Namespace = clusterToNamespace(cluster.Namespace, cluster.Name)
+		status.Namespace = clusterNamespace(cluster.Namespace, cluster.Name)
 	}
 
 	bundleDeployments, err := h.bundleDeployment.List(status.Namespace, labels.Everything())
@@ -170,10 +179,12 @@ func (h *handler) OnClusterChanged(cluster *fleet.Cluster, status fleet.ClusterS
 	}
 
 	if allReady && status.ResourceCounts.Ready != status.ResourceCounts.DesiredReady {
-		// Counts from gitrepo are out of sync with bundleDeployment state
-		// just retry in 15 seconds as there no great way to trigger an event that
-		// doesn't cause a loop
-		h.clusters.EnqueueAfter(cluster.Namespace, cluster.Name, 15*time.Second)
+		logrus.Debugf("Cluster %s/%s is not ready because not all gitrepos are ready: %d/%d, enqueue cluster again",
+			cluster.Namespace, cluster.Name, status.ResourceCounts.Ready, status.ResourceCounts.DesiredReady)
+
+		// Counts from gitrepo are out of sync with bundleDeployment state, retry in a number of seconds.
+		// Time depends on the rate limiter, see controllers.go newSharedControllerFactory()
+		h.clusters.Enqueue(cluster.Namespace, cluster.Name)
 	}
 
 	summary.SetReadyConditions(&status, "Bundle", status.Summary)

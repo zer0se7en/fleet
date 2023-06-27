@@ -1,26 +1,39 @@
+// Package target provides functionality around building and deploying bundledeployments. (fleetcontroller)
+//
+// Each "Target" represents a bundle, cluster pair and will be transformed into a bundledeployment.
+// The manifest, persisted in the content resource, contains the resources available to
+// these bundledeployments.
 package target
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	kyaml "sigs.k8s.io/yaml"
+
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
-	"github.com/rancher/fleet/pkg/bundle"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/manifest"
 	"github.com/rancher/fleet/pkg/options"
 	"github.com/rancher/fleet/pkg/summary"
-	"github.com/rancher/wrangler/pkg/data"
+	"github.com/rancher/fleet/pkg/target/matcher"
+
 	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/pkg/name"
 	"github.com/rancher/wrangler/pkg/yaml"
-	"github.com/sirupsen/logrus"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	"github.com/Masterminds/sprig/v3"
 )
 
 var (
@@ -28,6 +41,11 @@ var (
 	defLimit                    = intstr.FromString("100%")
 	defAutoPartitionSize        = intstr.FromString("25%")
 	defMaxUnavailablePartitions = intstr.FromInt(0)
+)
+
+const (
+	maxTemplateRecursionDepth = 50
+	clusterLabelPrefix        = "global.fleet.clusterLabels."
 )
 
 type Manager struct {
@@ -61,11 +79,17 @@ func New(
 }
 
 func (m *Manager) BundleFromDeployment(bd *fleet.BundleDeployment) (string, string) {
-	return bd.Labels["fleet.cattle.io/bundle-namespace"],
-		bd.Labels["fleet.cattle.io/bundle-name"]
+	return bd.Labels[fleet.BundleNamespaceLabel],
+		bd.Labels[fleet.BundleLabel]
 }
 
-func ClusterGroupsToLabelMap(cgs []*fleet.ClusterGroup) map[string]map[string]string {
+// StoreManifest stores the manifest as a content resource and returns the name.
+// It copies the resources from the bundle to the content resource.
+func (m *Manager) StoreManifest(manifest *manifest.Manifest) (string, error) {
+	return m.contentStore.Store(manifest)
+}
+
+func clusterGroupsToLabelMap(cgs []*fleet.ClusterGroup) map[string]map[string]string {
 	result := map[string]map[string]string{}
 	for _, cg := range cgs {
 		result[cg.Name] = cg.Labels
@@ -100,8 +124,20 @@ func (m *Manager) clusterGroupsForCluster(cluster *fleet.Cluster) (result []*fle
 func (m *Manager) getBundlesInScopeForCluster(cluster *fleet.Cluster) ([]*fleet.Bundle, error) {
 	bundleSet := newBundleSet()
 
-	if err := bundleSet.insert(m.bundleCache.List(cluster.Namespace, labels.Everything())); err != nil {
+	// all bundles in the cluster namespace are in scope
+	// except for agent bundles of other clusters
+	bundles, err := m.bundleCache.List(cluster.Namespace, labels.Everything())
+	if err != nil {
 		return nil, err
+	}
+	for _, b := range bundles {
+		if b.Annotations["objectset.rio.cattle.io/id"] == "fleet-manage-agent" {
+			if b.Name == "fleet-agent-"+cluster.Name {
+				bundleSet.insertSingle(b)
+			}
+		} else {
+			bundleSet.insertSingle(b)
+		}
 	}
 
 	mappings, err := m.bundleNamespaceMappingCache.List("", labels.Everything())
@@ -126,14 +162,14 @@ func (m *Manager) getBundlesInScopeForCluster(cluster *fleet.Cluster) ([]*fleet.
 	return bundleSet.bundles(), nil
 }
 
-func (m *Manager) BundlesForCluster(cluster *fleet.Cluster) (result []*fleet.Bundle, _ error) {
+func (m *Manager) BundlesForCluster(cluster *fleet.Cluster) (bundlesToRefresh, bundlesToCleanup []*fleet.Bundle, err error) {
 	bundles, err := m.getBundlesInScopeForCluster(cluster)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, app := range bundles {
-		bundle, err := bundle.New(app)
+		bm, err := matcher.New(app)
 		if err != nil {
 			logrus.Errorf("ignore bad app %s/%s: %v", app.Namespace, app.Name, err)
 			continue
@@ -141,37 +177,60 @@ func (m *Manager) BundlesForCluster(cluster *fleet.Cluster) (result []*fleet.Bun
 
 		cgs, err := m.clusterGroupsForCluster(cluster)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
-		m := bundle.Match(cluster.Name, ClusterGroupsToLabelMap(cgs), cluster.Labels)
-		if m != nil {
-			result = append(result, app)
+		match := bm.Match(cluster.Name, clusterGroupsToLabelMap(cgs), cluster.Labels)
+		if match != nil {
+			bundlesToRefresh = append(bundlesToRefresh, app)
+		} else {
+			bundlesToCleanup = append(bundlesToCleanup, app)
 		}
 	}
 
 	return
 }
 
-func (m *Manager) getNamespacesForBundle(fleetBundle *fleet.Bundle) ([]string, error) {
-	mappings, err := m.bundleNamespaceMappingCache.List(fleetBundle.Namespace, labels.Everything())
+func (m *Manager) GetBundleDeploymentsForBundleInCluster(app *fleet.Bundle, cluster *fleet.Cluster) (result []*fleet.BundleDeployment, err error) {
+	bundleDeployments, err := m.bundleDeploymentCache.List("", labels.SelectorFromSet(deploymentLabelsForSelector(app)))
+	if err != nil {
+		return nil, err
+	}
+	nsPrefix := name.SafeConcatName("cluster", cluster.Namespace, cluster.Name)
+	for _, bd := range bundleDeployments {
+		if strings.HasPrefix(bd.Namespace, nsPrefix) {
+			result = append(result, bd)
+		}
+	}
+
+	return result, nil
+}
+
+// getNamespacesForBundle returns the namespaces that bundledeployments could
+// be created in.
+// These are the bundle's namespace, e.g. "fleet-local", and every namespace
+// matched by a bundle namespace mapping resource.
+func (m *Manager) getNamespacesForBundle(bundle *fleet.Bundle) ([]string, error) {
+	mappings, err := m.bundleNamespaceMappingCache.List(bundle.Namespace, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
 
-	nses := sets.NewString(fleetBundle.Namespace)
+	nses := sets.NewString(bundle.Namespace)
 	for _, mapping := range mappings {
 		matcher, err := NewBundleMapping(mapping, m.namespaceCache, m.bundleCache)
 		if err != nil {
 			logrus.Errorf("invalid BundleNamespaceMapping %s/%s skipping: %v", mapping.Namespace, mapping.Name, err)
 			continue
 		}
-		namespaces, err := matcher.Namespaces()
-		if err != nil {
-			return nil, err
-		}
-		for _, namespace := range namespaces {
-			nses.Insert(namespace.Name)
+		if matcher.Matches(bundle) {
+			namespaces, err := matcher.Namespaces()
+			if err != nil {
+				return nil, err
+			}
+			for _, namespace := range namespaces {
+				nses.Insert(namespace.Name)
+			}
 		}
 	}
 
@@ -179,26 +238,24 @@ func (m *Manager) getNamespacesForBundle(fleetBundle *fleet.Bundle) ([]string, e
 	return nses.List(), nil
 }
 
-func (m *Manager) Targets(fleetBundle *fleet.Bundle) (result []*Target, _ error) {
-	bundle, err := bundle.New(fleetBundle)
+// Targets returns all targets for a bundle, so we can create bundledeployments for each.
+// This is done by checking all namespaces for clusters matching the bundle's
+// BundleTarget matchers.
+//
+// The returned target structs contain merged BundleDeploymentOptions.
+// Finally all existing bundledeployments are added to the targets.
+func (m *Manager) Targets(bundle *fleet.Bundle, manifest *manifest.Manifest) ([]*Target, error) {
+	bm, err := matcher.New(bundle)
 	if err != nil {
 		return nil, err
 	}
 
-	manifest, err := manifest.New(&bundle.Definition.Spec)
+	namespaces, err := m.getNamespacesForBundle(bundle)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := m.contentStore.Store(manifest); err != nil {
-		return nil, err
-	}
-
-	namespaces, err := m.getNamespacesForBundle(fleetBundle)
-	if err != nil {
-		return nil, err
-	}
-
+	var targets []*Target
 	for _, namespace := range namespaces {
 		clusters, err := m.clusters.List(namespace, labels.Everything())
 		if err != nil {
@@ -211,13 +268,23 @@ func (m *Manager) Targets(fleetBundle *fleet.Bundle) (result []*Target, _ error)
 				return nil, err
 			}
 
-			match := bundle.Match(cluster.Name, ClusterGroupsToLabelMap(clusterGroups), cluster.Labels)
-			if match == nil {
+			target := bm.Match(cluster.Name, clusterGroupsToLabelMap(clusterGroups), cluster.Labels)
+			if target == nil {
 				continue
 			}
+			// check if there is any matching targetCustomization that should be applied
+			targetOpts := target.BundleDeploymentOptions
+			targetCustomized := bm.MatchTargetCustomizations(cluster.Name, clusterGroupsToLabelMap(clusterGroups), cluster.Labels)
+			if targetCustomized != nil {
+				if targetCustomized.DoNotDeploy {
+					logrus.Debugf("BundleDeployment creation for Bundle '%s' was skipped because doNotDeploy is set to true.", bundle.Name)
+					continue
+				}
+				targetOpts = targetCustomized.BundleDeploymentOptions
+			}
 
-			opts := options.Calculate(&fleetBundle.Spec, match.Target)
-			err = addClusterLabels(&opts, cluster.Labels)
+			opts := options.Merge(bundle.Spec.BundleDeploymentOptions, targetOpts)
+			err = preprocessHelmValues(&opts, cluster)
 			if err != nil {
 				return nil, err
 			}
@@ -227,27 +294,28 @@ func (m *Manager) Targets(fleetBundle *fleet.Bundle) (result []*Target, _ error)
 				return nil, err
 			}
 
-			result = append(result, &Target{
+			targets = append(targets, &Target{
 				ClusterGroups: clusterGroups,
 				Cluster:       cluster,
-				Target:        match.Target,
-				Bundle:        fleetBundle,
+				Bundle:        bundle,
 				Options:       opts,
 				DeploymentID:  deploymentID,
 			})
 		}
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Cluster.Name < result[j].Cluster.Name
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].Cluster.Name < targets[j].Cluster.Name
 	})
 
-	return result, m.foldInDeployments(fleetBundle, result)
+	return targets, m.foldInDeployments(bundle, targets)
 }
 
-func addClusterLabels(opts *fleet.BundleDeploymentOptions, labels map[string]string) (err error) {
-	clusterLabels := yaml.CleanAnnotationsForExport(labels)
-	for k, v := range labels {
+func preprocessHelmValues(opts *fleet.BundleDeploymentOptions, cluster *fleet.Cluster) (err error) {
+	clusterLabels := yaml.CleanAnnotationsForExport(cluster.Labels)
+	clusterAnnotations := yaml.CleanAnnotationsForExport(cluster.Annotations)
+
+	for k, v := range cluster.Labels {
 		if strings.HasPrefix(k, "fleet.cattle.io/") || strings.HasPrefix(k, "management.cattle.io/") {
 			clusterLabels[k] = v
 		}
@@ -256,49 +324,68 @@ func addClusterLabels(opts *fleet.BundleDeploymentOptions, labels map[string]str
 		return
 	}
 
-	newValues := map[string]interface{}{
-		"global": map[string]interface{}{
-			"fleet": map[string]interface{}{
-				"clusterLabels": clusterLabels,
-			},
-		},
-	}
-
 	if opts.Helm == nil {
-		opts.Helm = &fleet.HelmOptions{
-			Values: &fleet.GenericMap{
-				Data: newValues,
-			},
-		}
+		opts.Helm = &fleet.HelmOptions{}
 		return nil
 	}
 
 	opts.Helm = opts.Helm.DeepCopy()
 	if opts.Helm.Values == nil || opts.Helm.Values.Data == nil {
 		opts.Helm.Values = &fleet.GenericMap{
-			Data: newValues,
+			Data: map[string]interface{}{},
 		}
 		return nil
 	}
 
-	if err := processLabelValues(opts.Helm.Values.Data, clusterLabels); err != nil {
+	if err := processLabelValues(opts.Helm.Values.Data, clusterLabels, 0); err != nil {
 		return err
 	}
 
-	opts.Helm.Values.Data = data.MergeMaps(opts.Helm.Values.Data, newValues)
+	if !opts.Helm.DisablePreProcess {
+
+		templateValues := map[string]interface{}{}
+		if cluster.Spec.TemplateValues != nil {
+			templateValues = cluster.Spec.TemplateValues.Data
+		}
+
+		values := map[string]interface{}{
+			"ClusterNamespace":   cluster.Namespace,
+			"ClusterName":        cluster.Name,
+			"ClusterLabels":      toDict(clusterLabels),
+			"ClusterAnnotations": toDict(clusterAnnotations),
+			"ClusterValues":      templateValues,
+		}
+
+		opts.Helm.Values.Data, err = processTemplateValues(opts.Helm.Values.Data, values)
+		if err != nil {
+			return err
+		}
+		logrus.Debugf("preProcess completed for %v", opts.Helm.ReleaseName)
+	}
+
 	return nil
 
 }
 
-func (m *Manager) foldInDeployments(app *fleet.Bundle, targets []*Target) error {
-	bundleDeployments, err := m.bundleDeploymentCache.List("", labels.SelectorFromSet(DeploymentLabelsForSelector(app)))
+// sprig dictionary functions like "default" and "hasKey" expect map[string]interface{}
+func toDict(values map[string]string) map[string]interface{} {
+	dict := make(map[string]interface{}, len(values))
+	for k, v := range values {
+		dict[k] = v
+	}
+	return dict
+}
+
+// foldInDeployments adds the existing bundledeployments to the targets.
+func (m *Manager) foldInDeployments(bundle *fleet.Bundle, targets []*Target) error {
+	bundleDeployments, err := m.bundleDeploymentCache.List("", labels.SelectorFromSet(deploymentLabelsForSelector(bundle)))
 	if err != nil {
 		return err
 	}
 
 	byNamespace := map[string]*fleet.BundleDeployment{}
-	for _, appDep := range bundleDeployments {
-		byNamespace[appDep.Namespace] = appDep.DeepCopy()
+	for _, bd := range bundleDeployments {
+		byNamespace[bd.Namespace] = bd.DeepCopy()
 	}
 
 	for _, target := range targets {
@@ -308,32 +395,11 @@ func (m *Manager) foldInDeployments(app *fleet.Bundle, targets []*Target) error 
 	return nil
 }
 
-func DeploymentLabelsForNewBundle(app *fleet.Bundle) map[string]string {
-	labels := yaml.CleanAnnotationsForExport(app.Labels)
-	for k, v := range app.Labels {
-		if strings.HasPrefix(k, "fleet.cattle.io/") {
-			labels[k] = v
-		}
-	}
-	for k, v := range DeploymentLabelsForSelector(app) {
-		labels[k] = v
-	}
-	return labels
-}
-
-func DeploymentLabelsForSelector(app *fleet.Bundle) map[string]string {
-	return map[string]string{
-		"fleet.cattle.io/bundle-name":      app.Name,
-		"fleet.cattle.io/bundle-namespace": app.Namespace,
-	}
-}
-
 type Target struct {
 	Deployment    *fleet.BundleDeployment
 	ClusterGroups []*fleet.ClusterGroup
 	Cluster       *fleet.Cluster
 	Bundle        *fleet.Bundle
-	Target        *fleet.BundleTarget
 	Options       fleet.BundleDeploymentOptions
 	DeploymentID  string
 }
@@ -343,21 +409,55 @@ func (t *Target) IsPaused() bool {
 		t.Bundle.Spec.Paused
 }
 
-func (t *Target) AssignNewDeployment() {
-	labels := map[string]string{}
-	for k, v := range DeploymentLabelsForNewBundle(t.Bundle) {
-		labels[k] = v
-	}
-	labels[fleet.ManagedLabel] = "true"
+// ResetDeployment replaces the BundleDeployment for the target with a new one
+func (t *Target) ResetDeployment() {
 	t.Deployment = &fleet.BundleDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      t.Bundle.Name,
 			Namespace: t.Cluster.Status.Namespace,
-			Labels:    labels,
+			Labels:    t.BundleDeploymentLabels(t.Cluster.Namespace, t.Cluster.Name),
 		},
 	}
 }
 
+// BundleDeploymentLabels builds all labels for a bundledeployment
+func (t *Target) BundleDeploymentLabels(clusterNamespace string, clusterName string) map[string]string {
+	// remove labels starting with kubectl.kubernetes.io or containing
+	// cattle.io from bundle
+	labels := yaml.CleanAnnotationsForExport(t.Bundle.Labels)
+
+	// copy fleet labels from bundle to bundledeployment
+	for k, v := range t.Bundle.Labels {
+		if strings.HasPrefix(k, "fleet.cattle.io/") {
+			labels[k] = v
+		}
+	}
+
+	// labels for the bundledeployment by bundle selector
+	for k, v := range deploymentLabelsForSelector(t.Bundle) {
+		labels[k] = v
+	}
+
+	// ManagedLabel allows clean up of the bundledeployment
+	labels[fleet.ManagedLabel] = "true"
+
+	// add labels to identify the cluster this bundledeployment belongs to
+	labels[fleet.ClusterNamespaceLabel] = clusterNamespace
+	labels[fleet.ClusterLabel] = clusterName
+
+	return labels
+}
+
+// deploymentLabelsForSelector returns the labels that are used to select
+// bundledeployments for a given bundle
+func deploymentLabelsForSelector(bundle *fleet.Bundle) map[string]string {
+	return map[string]string{
+		fleet.BundleLabel:          bundle.Name,
+		fleet.BundleNamespaceLabel: bundle.Namespace,
+	}
+}
+
+// getRollout returns the rollout strategy for the specified targets (pure function)
 func getRollout(targets []*Target) *fleet.RolloutStrategy {
 	var rollout *fleet.RolloutStrategy
 	if len(targets) > 0 {
@@ -369,7 +469,7 @@ func getRollout(targets []*Target) *fleet.RolloutStrategy {
 	return rollout
 }
 
-func Limit(count int, val ...*intstr.IntOrString) (int, error) {
+func limit(count int, val ...*intstr.IntOrString) (int, error) {
 	if count == 0 {
 		return 1, nil
 	}
@@ -417,22 +517,26 @@ func Limit(count int, val ...*intstr.IntOrString) (int, error) {
 	return i, nil
 }
 
+// MaxUnavailable returns the maximum number of unavailable deployments given the targets rollout strategy (pure function)
 func MaxUnavailable(targets []*Target) (int, error) {
 	rollout := getRollout(targets)
-	return Limit(len(targets), rollout.MaxUnavailable)
+	return limit(len(targets), rollout.MaxUnavailable)
 }
 
+// MaxUnavailablePartitions returns the maximum number of unavailable partitions given the targets and partitions (pure function)
 func MaxUnavailablePartitions(partitions []Partition, targets []*Target) (int, error) {
 	rollout := getRollout(targets)
-	return Limit(len(partitions), rollout.MaxUnavailablePartitions, &defMaxUnavailablePartitions)
+	return limit(len(partitions), rollout.MaxUnavailablePartitions, &defMaxUnavailablePartitions)
 }
 
-func IsPartitionUnavailable(status *fleet.PartitionStatus, targets []*Target) bool {
+// UpdateStatusUnavailable recomputes and sets the status.Unavailable counter and returns true if the partition
+// is unavailable, eg. there are more unavailable targets than the maximum set (does not mutate targets)
+func UpdateStatusUnavailable(status *fleet.PartitionStatus, targets []*Target) bool {
 	// Unavailable for a partition is stricter than unavailable for a target.
 	// For a partition a target must be available and update to date.
 	status.Unavailable = 0
 	for _, target := range targets {
-		if !UpToDate(target) || IsUnavailable(target.Deployment) {
+		if !upToDate(target) || IsUnavailable(target.Deployment) {
 			status.Unavailable++
 		}
 	}
@@ -440,7 +544,8 @@ func IsPartitionUnavailable(status *fleet.PartitionStatus, targets []*Target) bo
 	return status.Unavailable > status.MaxUnavailable
 }
 
-func UpToDate(target *Target) bool {
+// upToDate returns true if the target is up to date (pure function)
+func upToDate(target *Target) bool {
 	if target.Deployment == nil ||
 		target.Deployment.Spec.StagedDeploymentID != target.DeploymentID ||
 		target.Deployment.Spec.DeploymentID != target.DeploymentID ||
@@ -451,6 +556,7 @@ func UpToDate(target *Target) bool {
 	return true
 }
 
+// Unavailable counts the number of targets that are not available (pure function)
 func Unavailable(targets []*Target) (count int) {
 	for _, target := range targets {
 		if target.Deployment == nil {
@@ -463,6 +569,7 @@ func Unavailable(targets []*Target) (count int) {
 	return
 }
 
+// IsUnavailable checks if target is not available (pure function)
 func IsUnavailable(target *fleet.BundleDeployment) bool {
 	if target == nil {
 		return false
@@ -471,21 +578,22 @@ func IsUnavailable(target *fleet.BundleDeployment) bool {
 		!target.Status.Ready
 }
 
-func (t *Target) Modified() []fleet.ModifiedStatus {
+func (t *Target) modified() []fleet.ModifiedStatus {
 	if t.Deployment == nil {
 		return nil
 	}
 	return t.Deployment.Status.ModifiedStatus
 }
 
-func (t *Target) NonReady() []fleet.NonReadyStatus {
+func (t *Target) nonReady() []fleet.NonReadyStatus {
 	if t.Deployment == nil {
 		return nil
 	}
 	return t.Deployment.Status.NonReadyStatus
 }
 
-func (t *Target) State() fleet.BundleState {
+// state calculates a fleet.BundleState from t (pure function)
+func (t *Target) state() fleet.BundleState {
 	switch {
 	case t.Deployment == nil:
 		return fleet.Pending
@@ -494,36 +602,84 @@ func (t *Target) State() fleet.BundleState {
 	}
 }
 
-func (t *Target) Message() string {
+// message returns a relevant message from the target (pure function)
+func (t *Target) message() string {
 	return summary.MessageFromDeployment(t.Deployment)
 }
 
+// Summary calculates a fleet.BundleSummary from targets (pure function)
 func Summary(targets []*Target) fleet.BundleSummary {
 	var bundleSummary fleet.BundleSummary
 	for _, currentTarget := range targets {
 		cluster := currentTarget.Cluster.Namespace + "/" + currentTarget.Cluster.Name
-		summary.IncrementState(&bundleSummary, cluster, currentTarget.State(), currentTarget.Message(), currentTarget.Modified(), currentTarget.NonReady())
+		summary.IncrementState(&bundleSummary, cluster, currentTarget.state(), currentTarget.message(), currentTarget.modified(), currentTarget.nonReady())
 		bundleSummary.DesiredReady++
 	}
 	return bundleSummary
 }
 
-func processLabelValues(valuesMap map[string]interface{}, clusterLabels map[string]string) error {
-	prefix := "global.fleet.clusterLabels."
+// tplFuncMap returns a mapping of all of the functions from sprig but removes potentially dangerous operations
+func tplFuncMap() template.FuncMap {
+	f := sprig.TxtFuncMap()
+	delete(f, "env")
+	delete(f, "expandenv")
+	delete(f, "include")
+	delete(f, "tpl")
+
+	return f
+}
+
+func processTemplateValues(helmValues map[string]interface{}, templateContext map[string]interface{}) (map[string]interface{}, error) {
+	data, err := kyaml.Marshal(helmValues)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal helm values section into a template: %w", err)
+	}
+
+	// fleet.yaml must be valid yaml, however '{}[]' are YAML control
+	// characters and will be interpreted as JSON data structures. This
+	// causes issues when parsing the fleet.yaml so we change the delims
+	// for templating to '${ }'
+	tmpl := template.New("values").Funcs(tplFuncMap()).Option("missingkey=error").Delims("${", "}")
+	tmpl, err = tmpl.Parse(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse helm values template: %w", err)
+	}
+
+	var b bytes.Buffer
+	err = tmpl.Execute(&b, templateContext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to render helm values template: %w", err)
+	}
+
+	var renderedValues map[string]interface{}
+	err = kyaml.Unmarshal(b.Bytes(), &renderedValues)
+	if err != nil {
+		return nil, fmt.Errorf("failed to interpret rendered template as helm values: %#v, %v", renderedValues, err)
+	}
+
+	return renderedValues, nil
+}
+
+func processLabelValues(valuesMap map[string]interface{}, clusterLabels map[string]string, recursionDepth int) error {
+	if recursionDepth > maxTemplateRecursionDepth {
+		return fmt.Errorf("maximum recursion depth of %v exceeded for cluster label prefix processing, too many nested values", maxTemplateRecursionDepth)
+	}
+
 	for key, val := range valuesMap {
 		valStr, ok := val.(string)
-		if ok && strings.HasPrefix(valStr, prefix) {
-			label := strings.TrimPrefix(valStr, prefix)
+		if ok && strings.HasPrefix(valStr, clusterLabelPrefix) {
+			label := strings.TrimPrefix(valStr, clusterLabelPrefix)
 			labelVal, labelPresent := clusterLabels[label]
 			if labelPresent {
 				valuesMap[key] = labelVal
 			} else {
-				return fmt.Errorf("invalid_label_reference %s in key %s", valStr, key)
+				valuesMap[key] = ""
+				logrus.Infof("Cluster label '%s' for key '%s' is missing from some clusters, setting value to empty string for these clusters.", valStr, key)
 			}
 		}
 
 		if valMap, ok := val.(map[string]interface{}); ok {
-			err := processLabelValues(valMap, clusterLabels)
+			err := processLabelValues(valMap, clusterLabels, recursionDepth+1)
 			if err != nil {
 				return err
 			}
@@ -532,7 +688,7 @@ func processLabelValues(valuesMap map[string]interface{}, clusterLabels map[stri
 		if valArr, ok := val.([]interface{}); ok {
 			for _, item := range valArr {
 				if itemMap, ok := item.(map[string]interface{}); ok {
-					err := processLabelValues(itemMap, clusterLabels)
+					err := processLabelValues(itemMap, clusterLabels, recursionDepth+1)
 					if err != nil {
 						return err
 					}

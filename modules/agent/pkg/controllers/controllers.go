@@ -1,31 +1,36 @@
+// Package controllers wires and starts the controllers for the agent. (fleetagent)
 package controllers
 
 import (
 	"context"
 	"time"
 
+	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/workqueue"
+
 	"github.com/rancher/fleet/modules/agent/pkg/controllers/bundledeployment"
 	"github.com/rancher/fleet/modules/agent/pkg/controllers/cluster"
 	"github.com/rancher/fleet/modules/agent/pkg/deployer"
 	"github.com/rancher/fleet/modules/agent/pkg/trigger"
+	"github.com/rancher/fleet/pkg/durations"
 	"github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/helmdeployer"
 	"github.com/rancher/fleet/pkg/manifest"
+
 	cache2 "github.com/rancher/lasso/pkg/cache"
 	"github.com/rancher/lasso/pkg/client"
 	"github.com/rancher/lasso/pkg/controller"
 	"github.com/rancher/wrangler/pkg/apply"
-	batch2 "github.com/rancher/wrangler/pkg/generated/controllers/batch"
 	batchcontrollers "github.com/rancher/wrangler/pkg/generated/controllers/batch/v1"
 	"github.com/rancher/wrangler/pkg/generated/controllers/core"
 	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	"github.com/rancher/wrangler/pkg/generated/controllers/rbac"
-	rbaccontrollers "github.com/rancher/wrangler/pkg/generated/controllers/rbac/v1"
 	"github.com/rancher/wrangler/pkg/leader"
 	"github.com/rancher/wrangler/pkg/ratelimit"
 	"github.com/rancher/wrangler/pkg/start"
-	"github.com/sirupsen/logrus"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -37,8 +42,6 @@ import (
 type appContext struct {
 	Fleet    fleetcontrollers.Interface
 	Core     corecontrollers.Interface
-	CoreNS   corecontrollers.Interface
-	RBAC     rbaccontrollers.Interface
 	Batch    batchcontrollers.Interface
 	Dynamic  dynamic.Interface
 	K8s      kubernetes.Interface
@@ -75,13 +78,12 @@ func (a *appContext) start(ctx context.Context) error {
 	return start.All(ctx, 5, a.starters...)
 }
 
-func Register(ctx context.Context, leaderElect bool,
+func Register(ctx context.Context,
 	fleetNamespace, agentNamespace, defaultNamespace, agentScope, clusterNamespace, clusterName string,
 	checkinInterval time.Duration,
 	fleetConfig *rest.Config, clientConfig clientcmd.ClientConfig,
 	fleetMapper, mapper meta.RESTMapper,
-	discovery discovery.CachedDiscoveryInterface,
-	startChan <-chan struct{}) error {
+	discovery discovery.CachedDiscoveryInterface) error {
 	appCtx, err := newContext(fleetNamespace, agentNamespace, clusterNamespace, clusterName,
 		fleetConfig, clientConfig, fleetMapper, mapper, discovery)
 	if err != nil {
@@ -109,6 +111,7 @@ func Register(ctx context.Context, leaderElect bool,
 			labelPrefix,
 			agentScope,
 			appCtx.Fleet.BundleDeployment().Cache(),
+			appCtx.Fleet.BundleDeployment(),
 			manifest.NewLookup(appCtx.Fleet.Content()),
 			helmDeployer,
 			appCtx.Apply),
@@ -122,20 +125,11 @@ func Register(ctx context.Context, leaderElect bool,
 		appCtx.Core.Node().Cache(),
 		appCtx.Fleet.Cluster())
 
-	if leaderElect {
-		leader.RunOrDie(ctx, agentNamespace, "fleet-agent-lock", appCtx.K8s, func(ctx context.Context) {
-			if err := appCtx.start(ctx); err != nil {
-				logrus.Fatal(err)
-			}
-		})
-	} else if startChan != nil {
-		go func() {
-			<-startChan
-			logrus.Fatalf("failed to start: %v", appCtx.start(ctx))
-		}()
-	} else {
-		return appCtx.start(ctx)
-	}
+	leader.RunOrDie(ctx, agentNamespace, "fleet-agent-lock", appCtx.K8s, func(ctx context.Context) {
+		if err := appCtx.start(ctx); err != nil {
+			logrus.Fatal(err)
+		}
+	})
 
 	return nil
 }
@@ -147,16 +141,23 @@ func newSharedControllerFactory(config *rest.Config, mapper meta.RESTMapper, nam
 	if err != nil {
 		return nil, err
 	}
-	return controller.NewSharedControllerFactory(cache2.NewSharedCachedFactory(cf, &cache2.SharedCacheFactoryOptions{
+
+	cacheFactory := cache2.NewSharedCachedFactory(cf, &cache2.SharedCacheFactoryOptions{
 		DefaultNamespace: namespace,
-		DefaultResync:    30 * time.Minute,
-	}), nil), nil
+		DefaultResync:    durations.DefaultResyncAgent,
+	})
+	slowRateLimiter := workqueue.NewItemExponentialFailureRateLimiter(durations.SlowFailureRateLimiterBase, durations.SlowFailureRateLimiterMax)
+	return controller.NewSharedControllerFactory(cacheFactory, &controller.SharedControllerFactoryOptions{
+		KindRateLimiter: map[schema.GroupVersionKind]workqueue.RateLimiter{
+			v1alpha1.SchemeGroupVersion.WithKind("BundleDeployment"): slowRateLimiter,
+		},
+	}), nil
 }
 
 func newContext(fleetNamespace, agentNamespace, clusterNamespace, clusterName string,
 	fleetConfig *rest.Config, clientConfig clientcmd.ClientConfig,
 	fleetMapper, mapper meta.RESTMapper, discovery discovery.CachedDiscoveryInterface) (*appContext, error) {
-	client, err := clientConfig.ClientConfig()
+	localConfig, err := clientConfig.ClientConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -166,26 +167,12 @@ func newContext(fleetNamespace, agentNamespace, clusterNamespace, clusterName st
 		return nil, err
 	}
 
-	localNSFactory, err := newSharedControllerFactory(client, mapper, agentNamespace)
+	localFactory, err := newSharedControllerFactory(localConfig, mapper, "")
 	if err != nil {
 		return nil, err
 	}
 
-	localFactory, err := newSharedControllerFactory(client, mapper, "")
-	if err != nil {
-		return nil, err
-	}
-
-	coreNSed, err := core.NewFactoryFromConfigWithOptions(client, &core.FactoryOptions{
-		Namespace:               agentNamespace,
-		SharedControllerFactory: localNSFactory,
-	})
-	if err != nil {
-		return nil, err
-	}
-	coreNSv := coreNSed.Core().V1()
-
-	core, err := core.NewFactoryFromConfigWithOptions(client, &core.FactoryOptions{
+	core, err := core.NewFactoryFromConfigWithOptions(localConfig, &core.FactoryOptions{
 		SharedControllerFactory: localFactory,
 	})
 	if err != nil {
@@ -201,36 +188,20 @@ func newContext(fleetNamespace, agentNamespace, clusterNamespace, clusterName st
 	}
 	fleetv := fleet.Fleet().V1alpha1()
 
-	rbac, err := rbac.NewFactoryFromConfigWithOptions(client, &rbac.FactoryOptions{
-		SharedControllerFactory: localFactory,
-	})
-	if err != nil {
-		return nil, err
-	}
-	rbacv := rbac.Rbac().V1()
-
-	batch, err := batch2.NewFactoryFromConfigWithOptions(client, &batch2.FactoryOptions{
-		SharedControllerFactory: localFactory,
-	})
-	if err != nil {
-		return nil, err
-	}
-	batchv := batch.Batch().V1()
-
-	apply, err := apply.NewForConfig(client)
+	apply, err := apply.NewForConfig(localConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	dynamic, err := dynamic.NewForConfig(client)
+	dynamic, err := dynamic.NewForConfig(localConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	client = rest.CopyConfig(client)
-	client.RateLimiter = ratelimit.None
+	localConfig = rest.CopyConfig(localConfig)
+	localConfig.RateLimiter = ratelimit.None
 
-	k8s, err := kubernetes.NewForConfig(client)
+	k8s, err := kubernetes.NewForConfig(localConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -240,24 +211,18 @@ func newContext(fleetNamespace, agentNamespace, clusterNamespace, clusterName st
 		Apply:            apply,
 		Fleet:            fleetv,
 		Core:             corev,
-		CoreNS:           coreNSv,
-		Batch:            batchv,
-		RBAC:             rbacv,
 		K8s:              k8s,
 		ClusterNamespace: clusterNamespace,
 		ClusterName:      clusterName,
 		AgentNamespace:   agentNamespace,
 
 		clientConfig:             clientConfig,
-		restConfig:               client,
+		restConfig:               localConfig,
 		cachedDiscoveryInterface: discovery,
 		restMapper:               mapper,
 		starters: []start.Starter{
 			core,
-			coreNSed,
 			fleet,
-			rbac,
-			batch,
 		},
 	}, nil
 }

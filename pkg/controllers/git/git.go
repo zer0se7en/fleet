@@ -1,3 +1,6 @@
+// Package git implements a controller that watches for GitRepo objects. (fleetcontrollers)
+//
+// It manages the lifecycle of GitJob resources for GitRepos. It cleans up orphaned bundles and image scans. Also updates the GitRepo and bundle status.
 package git
 
 import (
@@ -8,15 +11,17 @@ import (
 	"sort"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/config"
 	"github.com/rancher/fleet/pkg/controllers/clusterregistration"
 	"github.com/rancher/fleet/pkg/display"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/summary"
+
 	gitjob "github.com/rancher/gitjob/pkg/apis/gitjob.cattle.io/v1"
 	v1 "github.com/rancher/gitjob/pkg/generated/controllers/gitjob.cattle.io/v1"
-	"github.com/rancher/lasso/pkg/client"
 	"github.com/rancher/wrangler/pkg/apply"
 	corev1controller "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/pkg/genericcondition"
@@ -24,6 +29,7 @@ import (
 	"github.com/rancher/wrangler/pkg/name"
 	"github.com/rancher/wrangler/pkg/relatedresource"
 	"github.com/rancher/wrangler/pkg/yaml"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -57,12 +63,15 @@ func Register(ctx context.Context,
 	}
 
 	gitRepos.OnChange(ctx, "gitjob-purge", h.DeleteOnChange)
+	// this will update the lastUpdateTime of the Accepted condition
 	fleetcontrollers.RegisterGitRepoGeneratingHandler(ctx, gitRepos, apply, "Accepted", "gitjobs", h.OnChange, nil)
+	// enqueue gitrepo when gitjob changes
 	relatedresource.Watch(ctx, "gitjobs",
 		relatedresource.OwnerResolver(true, fleet.SchemeGroupVersion.String(), "GitRepo"), gitRepos, gitJobs)
 	relatedresource.Watch(ctx, "gitjobs", resolveGitRepo, gitRepos, bundles)
 }
 
+// resolveGitRepo enqueues a GitRepo event for a bundle change
 func resolveGitRepo(namespace, name string, obj runtime.Object) ([]relatedresource.Key, error) {
 	if bundle, ok := obj.(*fleet.Bundle); ok {
 		repo := bundle.Labels[fleet.RepoLabel]
@@ -77,7 +86,6 @@ func resolveGitRepo(namespace, name string, obj runtime.Object) ([]relatedresour
 }
 
 type handler struct {
-	shareClientFactory  client.SharedClientFactory
 	gitjobCache         v1.GitJobCache
 	secrets             corev1controller.SecretCache
 	bundleCache         fleetcontrollers.BundleCache
@@ -100,6 +108,10 @@ func targetsOrDefault(targets []fleet.GitTarget) []fleet.GitTarget {
 	return targets
 }
 
+// getConfig builds a config map, containing the GitTarget cluster matchers, converted to BundleTargets.
+// The BundleTargets are duplicated into TargetRestrictions. TargetRestrictions is a whilelist. A BundleDeployment
+// will be created for a Target just if it is inside a TargetRestrictions. If it is not inside TargetRestrictions a Target
+// is a TargetCustomization.
 func (h *handler) getConfig(repo *fleet.GitRepo) (*corev1.ConfigMap, error) {
 	spec := &fleet.BundleSpec{}
 	for _, target := range targetsOrDefault(repo.Spec.Targets) {
@@ -110,13 +122,7 @@ func (h *handler) getConfig(repo *fleet.GitRepo) (*corev1.ConfigMap, error) {
 			ClusterGroup:         target.ClusterGroup,
 			ClusterGroupSelector: target.ClusterGroupSelector,
 		})
-		spec.TargetRestrictions = append(spec.TargetRestrictions, fleet.BundleTargetRestriction{
-			Name:                 target.Name,
-			ClusterName:          target.ClusterName,
-			ClusterSelector:      target.ClusterSelector,
-			ClusterGroup:         target.ClusterGroup,
-			ClusterGroupSelector: target.ClusterGroupSelector,
-		})
+		spec.TargetRestrictions = append(spec.TargetRestrictions, fleet.BundleTargetRestriction(target))
 	}
 	data, err := json.Marshal(spec)
 	if err != nil {
@@ -148,25 +154,30 @@ func (h *handler) authorizeAndAssignDefaults(gitrepo *fleet.GitRepo) (*fleet.Git
 	restriction := aggregate(restrictions)
 	gitrepo = gitrepo.DeepCopy()
 
-	gitrepo.Spec.ServiceAccount, err = isAllowed(gitrepo.Spec.ServiceAccount,
-		restriction.DefaultServiceAccount,
-		restriction.AllowedServiceAccounts,
-		false)
-	if err != nil {
-		return nil, fmt.Errorf("disallowed serviceAcount %s: %w", gitrepo.Spec.ServiceAccount, err)
+	if len(restriction.AllowedTargetNamespaces) > 0 && gitrepo.Spec.TargetNamespace == "" {
+		return nil, fmt.Errorf("empty targetNamespace denied, because allowedTargetNamespaces restriction is present")
 	}
 
-	gitrepo.Spec.Repo, err = isAllowed(gitrepo.Spec.Repo,
-		"",
-		restriction.AllowedRepoPatterns,
-		true)
+	gitrepo.Spec.TargetNamespace, err = isAllowed(gitrepo.Spec.TargetNamespace, "", restriction.AllowedTargetNamespaces)
+	if err != nil {
+		return nil, fmt.Errorf("disallowed targetNamespace %s: %w", gitrepo.Spec.TargetNamespace, err)
+	}
+
+	gitrepo.Spec.ServiceAccount, err = isAllowed(gitrepo.Spec.ServiceAccount,
+		restriction.DefaultServiceAccount,
+		restriction.AllowedServiceAccounts)
+	if err != nil {
+		return nil, fmt.Errorf("disallowed serviceAccount %s: %w", gitrepo.Spec.ServiceAccount, err)
+	}
+
+	gitrepo.Spec.Repo, err = isAllowedByRegex(gitrepo.Spec.Repo, "", restriction.AllowedRepoPatterns)
 	if err != nil {
 		return nil, fmt.Errorf("disallowed repo %s: %w", gitrepo.Spec.ServiceAccount, err)
 	}
 
 	gitrepo.Spec.ClientSecretName, err = isAllowed(gitrepo.Spec.ClientSecretName,
 		restriction.DefaultClientSecretName,
-		restriction.AllowedClientSecretNames, false)
+		restriction.AllowedClientSecretNames)
 	if err != nil {
 		return nil, fmt.Errorf("disallowed clientSecretName %s: %w", gitrepo.Spec.ServiceAccount, err)
 	}
@@ -174,7 +185,7 @@ func (h *handler) authorizeAndAssignDefaults(gitrepo *fleet.GitRepo) (*fleet.Git
 	return gitrepo, nil
 }
 
-func isAllowed(currentValue, defaultValue string, allowedValues []string, pattern bool) (string, error) {
+func isAllowed(currentValue, defaultValue string, allowedValues []string) (string, error) {
 	if currentValue == "" {
 		return defaultValue, nil
 	}
@@ -185,19 +196,35 @@ func isAllowed(currentValue, defaultValue string, allowedValues []string, patter
 		if allowedValue == currentValue {
 			return currentValue, nil
 		}
-		if !pattern {
-			continue
+	}
+
+	return currentValue, fmt.Errorf("%s not in allowed set %v", currentValue, allowedValues)
+}
+
+func isAllowedByRegex(currentValue, defaultValue string, patterns []string) (string, error) {
+	if currentValue == "" {
+		return defaultValue, nil
+	}
+	if len(patterns) == 0 {
+		return currentValue, nil
+	}
+	for _, pattern := range patterns {
+		// for compatibility with previous versions, the patterns can match verbatim
+		if pattern == currentValue {
+			return currentValue, nil
 		}
-		p, err := regexp.Compile(allowedValue)
+
+		p, err := regexp.Compile(pattern)
 		if err != nil {
+			logrus.Infof("GitRepoRestriction failed to compile regex '%s'", pattern)
 			return currentValue, err
 		}
-		if p.MatchString(allowedValue) {
+		if p.MatchString(currentValue) {
 			return currentValue, nil
 		}
 	}
 
-	return currentValue, fmt.Errorf("%s not in allowed set %v", currentValue, allowedValues)
+	return currentValue, fmt.Errorf("%s not in allowed set %v", currentValue, patterns)
 }
 
 func aggregate(restrictions []*fleet.GitRepoRestriction) (result fleet.GitRepoRestriction) {
@@ -214,6 +241,7 @@ func aggregate(restrictions []*fleet.GitRepoRestriction) (result fleet.GitRepoRe
 		result.AllowedServiceAccounts = append(result.AllowedServiceAccounts, restriction.AllowedServiceAccounts...)
 		result.AllowedClientSecretNames = append(result.AllowedClientSecretNames, restriction.AllowedClientSecretNames...)
 		result.AllowedRepoPatterns = append(result.AllowedRepoPatterns, restriction.AllowedRepoPatterns...)
+		result.AllowedTargetNamespaces = append(result.AllowedTargetNamespaces, restriction.AllowedTargetNamespaces...)
 	}
 	return
 }
@@ -222,6 +250,8 @@ func (h *handler) DeleteOnChange(key string, gitrepo *fleet.GitRepo) (*fleet.Git
 	if gitrepo != nil {
 		return gitrepo, nil
 	}
+
+	logrus.Debugf("GitRepo '%s' deleted, deleting bundle, image scane", key)
 
 	ns, name := kv.Split(key, "/")
 	bundles, err := h.bundleCache.List(ns, labels.SelectorFromSet(labels.Set{
@@ -252,7 +282,6 @@ func (h *handler) DeleteOnChange(key string, gitrepo *fleet.GitRepo) (*fleet.Git
 		}
 
 	}
-
 	return nil, nil
 }
 
@@ -273,14 +302,29 @@ func mergeConditions(existing, next []genericcondition.GenericCondition) []gener
 	return result
 }
 
+func acceptedLastUpdate(conds []genericcondition.GenericCondition) string {
+	for _, cond := range conds {
+		if cond.Type == "Accepted" {
+			return cond.LastUpdateTime
+		}
+	}
+
+	return ""
+}
+
 func (h *handler) OnChange(gitrepo *fleet.GitRepo, status fleet.GitRepoStatus) ([]runtime.Object, fleet.GitRepoStatus, error) {
+	logrus.Debugf("OnChange GitRepo %s/%s for commit %s last accepted at %s", gitrepo.Namespace, gitrepo.Name, gitrepo.Status.Commit, acceptedLastUpdate(gitrepo.Status.Conditions))
 	status.ObservedGeneration = gitrepo.Generation
 
 	if gitrepo.Spec.Repo == "" {
 		return nil, status, nil
 	}
 
-	if gitrepo.Spec.HelmSecretName != "" {
+	if gitrepo.Spec.HelmSecretNameForPaths != "" {
+		if _, err := h.secrets.Get(gitrepo.Namespace, gitrepo.Spec.HelmSecretNameForPaths); err != nil {
+			return nil, status, fmt.Errorf("failed to look up HelmSecretNameForPaths, error: %v", err)
+		}
+	} else if gitrepo.Spec.HelmSecretName != "" {
 		if _, err := h.secrets.Get(gitrepo.Namespace, gitrepo.Spec.HelmSecretName); err != nil {
 			return nil, status, fmt.Errorf("failed to look up helmSecretName, error: %v", err)
 		}
@@ -340,7 +384,7 @@ func (h *handler) OnChange(gitrepo *fleet.GitRepo, status fleet.GitRepoStatus) (
 	}
 	status.Resources, status.ResourceErrors = h.display.Render(gitrepo.Namespace, gitrepo.Name, bundleErrorState)
 	status = countResources(status)
-	volumes, volumeMounts := volumes(gitrepo, configMap)
+	volumes, volumeMounts := volumes(h.secrets, gitrepo, configMap)
 	args, envs := argsAndEnvs(gitrepo)
 	return []runtime.Object{
 		configMap,
@@ -357,7 +401,7 @@ func (h *handler) OnChange(gitrepo *fleet.GitRepo, status fleet.GitRepoStatus) (
 			},
 			Rules: []rbacv1.PolicyRule{
 				{
-					Verbs:     []string{"get", "create", "update"},
+					Verbs:     []string{"get", "create", "update", "list", "delete"},
 					APIGroups: []string{"fleet.cattle.io"},
 					Resources: []string{"bundles", "imagescans"},
 				},
@@ -425,7 +469,8 @@ func (h *handler) OnChange(gitrepo *fleet.GitRepo, status fleet.GitRepoStatus) (
 									Name:            "fleet",
 									Image:           config.Get().AgentImage,
 									ImagePullPolicy: corev1.PullPolicy(config.Get().AgentImagePullPolicy),
-									Command:         append(args, paths...),
+									Command:         []string{"log.sh"},
+									Args:            append(args, paths...),
 									WorkingDir:      "/workspace/source",
 									VolumeMounts:    volumeMounts,
 									Env:             envs,
@@ -478,8 +523,8 @@ func (h *handler) setBundleStatus(gitrepo *fleet.GitRepo, status fleet.GitRepoSt
 	}
 
 	bundleDeployments, err := h.bundleDeployments.List("", labels.SelectorFromSet(labels.Set{
-		fleet.RepoLabel:                    gitrepo.Name,
-		"fleet.cattle.io/bundle-namespace": gitrepo.Namespace,
+		fleet.RepoLabel:            gitrepo.Name,
+		fleet.BundleNamespaceLabel: gitrepo.Namespace,
 	}))
 	if err != nil {
 		return status, err
@@ -549,7 +594,12 @@ func (h *handler) setBundleStatus(gitrepo *fleet.GitRepo, status fleet.GitRepoSt
 	return status, nil
 }
 
-func volumes(gitrepo *fleet.GitRepo, configMap *corev1.ConfigMap) ([]corev1.Volume, []corev1.VolumeMount) {
+// volumes builds sets of volumes and their volume mounts based on configuration and secrets.
+func volumes(
+	secrets corev1controller.SecretCache,
+	gitrepo *fleet.GitRepo,
+	configMap *corev1.ConfigMap,
+) ([]corev1.Volume, []corev1.VolumeMount) {
 	volumes := []corev1.Volume{
 		{
 			Name: "config",
@@ -570,39 +620,133 @@ func volumes(gitrepo *fleet.GitRepo, configMap *corev1.ConfigMap) ([]corev1.Volu
 		},
 	}
 
-	if gitrepo.Spec.HelmSecretName != "" {
-		volumes = append(volumes, corev1.Volume{
-			Name: "helm-secret",
+	if gitrepo.Spec.HelmSecretNameForPaths != "" {
+		vols, volMnts := volumesFromSecret(
+			secrets,
+			gitrepo.Namespace,
+			gitrepo.Spec.HelmSecretNameForPaths,
+			"helm-secret-by-path",
+		)
+
+		volumes = append(volumes, vols...)
+		volumeMounts = append(volumeMounts, volMnts...)
+
+	} else if gitrepo.Spec.HelmSecretName != "" {
+		vols, volMnts := volumesFromSecret(secrets, gitrepo.Namespace, gitrepo.Spec.HelmSecretName, "helm-secret")
+
+		volumes = append(volumes, vols...)
+		volumeMounts = append(volumeMounts, volMnts...)
+	}
+
+	return volumes, volumeMounts
+}
+
+// volumesFromSecret generates volumes and volume mounts from a Helm secret, assuming that that secret exists.
+func volumesFromSecret(
+	secrets corev1controller.SecretCache,
+	namespace string,
+	secretName, volumeName string,
+) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := []corev1.Volume{
+		{
+			Name: volumeName,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: gitrepo.Spec.HelmSecretName,
+					SecretName: secretName,
+				},
+			},
+		},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      volumeName,
+			MountPath: "/etc/fleet/helm",
+		},
+	}
+
+	// Mount a CA certificate, if specified in the secret. This is necessary to support Helm registries with
+	// self-signed certificates.
+	secret, _ := secrets.Get(namespace, secretName)
+	if _, ok := secret.Data["cacerts"]; ok {
+		certVolumeName := fmt.Sprintf("%s-cert", volumeName)
+
+		volumes = append(volumes, corev1.Volume{
+			Name: certVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: secretName,
+					Items: []corev1.KeyToPath{
+						{
+							Key:  "cacerts",
+							Path: "cacert.crt",
+						},
+					},
 				},
 			},
 		})
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "helm-secret",
-			MountPath: "/etc/fleet/helm",
+			Name:      certVolumeName,
+			MountPath: "/etc/ssl/certs",
 		})
 	}
+
 	return volumes, volumeMounts
 }
 
 func argsAndEnvs(gitrepo *fleet.GitRepo) ([]string, []corev1.EnvVar) {
 	args := []string{
-		"log.sh",
 		"fleet",
 		"apply",
+	}
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		args = append(args, "--debug", "--debug-level", "9")
+	}
+
+	bundleLabels := labels.Merge(gitrepo.Labels, map[string]string{
+		fleet.RepoLabel: gitrepo.Name,
+	})
+
+	args = append(args,
 		"--targets-file=/run/config/targets.yaml",
-		"--label=" + fleet.RepoLabel + "=" + gitrepo.Name,
+		"--label="+bundleLabels.String(),
 		"--namespace", gitrepo.Namespace,
 		"--service-account", gitrepo.Spec.ServiceAccount,
 		fmt.Sprintf("--sync-generation=%d", gitrepo.Spec.ForceSyncGeneration),
 		fmt.Sprintf("--paused=%v", gitrepo.Spec.Paused),
 		"--target-namespace", gitrepo.Spec.TargetNamespace,
+	)
+
+	if gitrepo.Spec.KeepResources {
+		args = append(args, "--keep-resources")
+	}
+
+	if gitrepo.Spec.CorrectDrift.Enabled {
+		args = append(args, "--correct-drift")
+		if gitrepo.Spec.CorrectDrift.Force {
+			args = append(args, "--correct-drift-force")
+		}
+		if gitrepo.Spec.CorrectDrift.KeepFailHistory {
+			args = append(args, "--correct-drift-keep-fail-history")
+		}
 	}
 
 	var env []corev1.EnvVar
-	if gitrepo.Spec.HelmSecretName != "" {
+	if gitrepo.Spec.HelmSecretNameForPaths != "" {
+		helmArgs := []string{
+			"--helm-credentials-by-path-file",
+			"/etc/fleet/helm/secrets-path.yaml",
+		}
+
+		args = append(args, helmArgs...)
+		env = append(env,
+			// for ssh go-getter, make sure we always accept new host key
+			corev1.EnvVar{
+				Name:  "GIT_SSH_COMMAND",
+				Value: "ssh -o stricthostkeychecking=accept-new",
+			},
+		)
+	} else if gitrepo.Spec.HelmSecretName != "" {
 		helmArgs := []string{
 			"--password-file",
 			"/etc/fleet/helm/password",
@@ -610,6 +754,9 @@ func argsAndEnvs(gitrepo *fleet.GitRepo) ([]string, []corev1.EnvVar) {
 			"/etc/fleet/helm/cacerts",
 			"--ssh-privatekey-file",
 			"/etc/fleet/helm/ssh-privatekey",
+		}
+		if gitrepo.Spec.HelmRepoURLRegex != "" {
+			helmArgs = append(helmArgs, "--helm-repo-url-regex", gitrepo.Spec.HelmRepoURLRegex)
 		}
 		args = append(args, helmArgs...)
 		env = append(env,
@@ -631,5 +778,6 @@ func argsAndEnvs(gitrepo *fleet.GitRepo) ([]string, []corev1.EnvVar) {
 				},
 			})
 	}
-	return append(args, gitrepo.Name), env
+
+	return append(args, "--", gitrepo.Name), env
 }

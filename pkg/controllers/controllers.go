@@ -1,8 +1,12 @@
+// Package controllers sets up the controllers for the fleet-controller. (fleetcontroller)
 package controllers
 
 import (
 	"context"
-	"time"
+
+	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/rancher/fleet/pkg/controllers/bootstrap"
 	"github.com/rancher/fleet/pkg/controllers/bundle"
@@ -17,11 +21,13 @@ import (
 	"github.com/rancher/fleet/pkg/controllers/git"
 	"github.com/rancher/fleet/pkg/controllers/image"
 	"github.com/rancher/fleet/pkg/controllers/manageagent"
+	"github.com/rancher/fleet/pkg/durations"
 	"github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/manifest"
 	fleetns "github.com/rancher/fleet/pkg/namespace"
 	"github.com/rancher/fleet/pkg/target"
+
 	"github.com/rancher/gitjob/pkg/generated/controllers/gitjob.cattle.io"
 	gitcontrollers "github.com/rancher/gitjob/pkg/generated/controllers/gitjob.cattle.io/v1"
 	"github.com/rancher/lasso/pkg/cache"
@@ -37,7 +43,7 @@ import (
 	"github.com/rancher/wrangler/pkg/leader"
 	"github.com/rancher/wrangler/pkg/ratelimit"
 	"github.com/rancher/wrangler/pkg/start"
-	"github.com/sirupsen/logrus"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	memory "k8s.io/client-go/discovery/cached"
 	"k8s.io/client-go/kubernetes"
@@ -60,22 +66,21 @@ type appContext struct {
 	Apply         apply.Apply
 	ClientConfig  clientcmd.ClientConfig
 	starters      []start.Starter
-	DisableGitops bool
 }
 
 func (a *appContext) start(ctx context.Context) error {
 	return start.All(ctx, 50, a.starters...)
 }
 
-func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientConfig, disableGitops bool) error {
-	appCtx, err := newContext(cfg, disableGitops)
+func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientConfig, disableGitops bool, disableBootstrap bool) error {
+	appCtx, err := newContext(cfg)
 	if err != nil {
 		return err
 	}
 
-	systemRegistrationNamespace := fleetns.RegistrationNamespace(systemNamespace)
+	systemRegistrationNamespace := fleetns.SystemRegistrationNamespace(systemNamespace)
 
-	if err := addData(systemNamespace, systemRegistrationNamespace, appCtx); err != nil {
+	if err := applyBootstrapResources(systemNamespace, systemRegistrationNamespace, appCtx); err != nil {
 		return err
 	}
 
@@ -88,7 +93,10 @@ func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientC
 	}
 
 	clusterregistration.Register(ctx,
-		appCtx.Apply,
+		appCtx.Apply.WithCacheTypes(
+			appCtx.RBAC.ClusterRole(),
+			appCtx.RBAC.ClusterRoleBinding(),
+		),
 		systemNamespace,
 		systemRegistrationNamespace,
 		appCtx.Core.ServiceAccount(),
@@ -143,7 +151,8 @@ func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientC
 			appCtx.RBAC.RoleBinding()),
 		appCtx.ClusterRegistrationToken(),
 		appCtx.Core.ServiceAccount(),
-		appCtx.Core.Secret().Cache())
+		appCtx.Core.Secret().Cache(),
+		appCtx.Core.Secret())
 
 	cleanup.Register(ctx,
 		appCtx.Apply.WithCacheTypes(
@@ -176,7 +185,7 @@ func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientC
 		appCtx.Cluster(),
 		appCtx.Bundle())
 
-	if !appCtx.DisableGitops {
+	if !disableGitops {
 		git.Register(ctx,
 			appCtx.Apply.WithCacheTypes(
 				appCtx.RBAC.Role(),
@@ -193,24 +202,26 @@ func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientC
 			appCtx.Core.Secret().Cache())
 	}
 
-	bootstrap.Register(ctx,
-		systemNamespace,
-		appCtx.Apply.WithCacheTypes(
-			appCtx.GitRepo(),
-			appCtx.Cluster(),
-			appCtx.ClusterGroup(),
-			appCtx.Core.Namespace(),
-			appCtx.Core.Secret()),
-		appCtx.ClientConfig,
-		appCtx.Core.ServiceAccount().Cache(),
-		appCtx.Core.Secret().Cache())
+	if !disableBootstrap {
+		bootstrap.Register(ctx,
+			systemNamespace,
+			appCtx.Apply.WithCacheTypes(
+				appCtx.GitRepo(),
+				appCtx.Cluster(),
+				appCtx.ClusterGroup(),
+				appCtx.Core.Namespace(),
+				appCtx.Core.Secret()),
+			appCtx.ClientConfig,
+			appCtx.Core.ServiceAccount().Cache(),
+			appCtx.Core.Secret(),
+			appCtx.Core.Secret().Cache())
+	}
 
 	display.Register(ctx,
 		appCtx.Cluster(),
 		appCtx.ClusterGroup(),
 		appCtx.GitRepo(),
-		appCtx.BundleDeployment(),
-		appCtx.Bundle())
+		appCtx.BundleDeployment())
 
 	image.Register(ctx,
 		appCtx.Core,
@@ -228,8 +239,8 @@ func Register(ctx context.Context, systemNamespace string, cfg clientcmd.ClientC
 }
 
 func controllerFactory(rest *rest.Config) (controller.SharedControllerFactory, error) {
-	rateLimit := workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 60*time.Second)
-	workqueue.DefaultControllerRateLimiter()
+	rateLimit := workqueue.NewItemExponentialFailureRateLimiter(durations.FailureRateLimiterBase, durations.FailureRateLimiterMax)
+	clusterRateLimiter := workqueue.NewItemExponentialFailureRateLimiter(durations.SlowFailureRateLimiterBase, durations.SlowFailureRateLimiterMax)
 	clientFactory, err := client.NewSharedClientFactory(rest, nil)
 	if err != nil {
 		return nil, err
@@ -237,12 +248,16 @@ func controllerFactory(rest *rest.Config) (controller.SharedControllerFactory, e
 
 	cacheFactory := cache.NewSharedCachedFactory(clientFactory, nil)
 	return controller.NewSharedControllerFactory(cacheFactory, &controller.SharedControllerFactoryOptions{
-		DefaultRateLimiter: rateLimit,
-		DefaultWorkers:     50,
+		DefaultRateLimiter:     rateLimit,
+		DefaultWorkers:         50,
+		SyncOnlyChangedObjects: true,
+		KindRateLimiter: map[schema.GroupVersionKind]workqueue.RateLimiter{
+			v1alpha1.SchemeGroupVersion.WithKind("Cluster"): clusterRateLimiter,
+		},
 	}), nil
 }
 
-func newContext(cfg clientcmd.ClientConfig, disableGitops bool) (*appContext, error) {
+func newContext(cfg clientcmd.ClientConfig) (*appContext, error) {
 	client, err := cfg.ClientConfig()
 	if err != nil {
 		return nil, err
@@ -335,6 +350,5 @@ func newContext(cfg clientcmd.ClientConfig, disableGitops bool) (*appContext, er
 			rbac,
 			git,
 		},
-		DisableGitops: disableGitops,
 	}, nil
 }

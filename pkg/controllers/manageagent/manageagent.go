@@ -1,3 +1,8 @@
+// Package manageagent provides a controller for managing the agent bundle. (fleetcontroller)
+//
+// Allows Fleet to deploy the Fleet Agent itself as a Bundle, which ensures
+// changes to Fleet’s configuration are reflected in the Agent.
+// The agent is deployed into the namespace, that contains a cluster resource.
 package manageagent
 
 import (
@@ -10,11 +15,14 @@ import (
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/config"
 	fleetcontrollers "github.com/rancher/fleet/pkg/generated/controllers/fleet.cattle.io/v1alpha1"
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher/wrangler/pkg/apply"
 	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/pkg/name"
 	"github.com/rancher/wrangler/pkg/relatedresource"
 	"github.com/rancher/wrangler/pkg/yaml"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -56,39 +64,130 @@ func Register(ctx context.Context,
 		clusters,
 		"Reconciled",
 		"agent-env-vars",
-		h.OnClusterChange)
+		h.onClusterStatusChange)
 }
 
-func (h *handler) OnClusterChange(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, error) {
-	// Check if the agent environment variables field was updated by hashing its contents into a status field.
-	return h.reconcileAgentEnvVars(cluster, status)
+func (h *handler) onClusterStatusChange(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, error) {
+	logrus.Debugf("Reconciling agent settings for cluster %s/%s", cluster.Namespace, cluster.Name)
+
+	status, vars, err := h.reconcileAgentEnvVars(cluster, status)
+	if err != nil {
+		return status, err
+	}
+
+	status, changed, err := h.updateClusterStatus(cluster, status)
+	if err != nil {
+		return status, err
+	}
+
+	if vars || changed {
+		// trigger importCluster to re-create the deployment, in case
+		// the agent cannot update itself from the bundle
+		status.AgentConfigChanged = true
+		h.namespaces.Enqueue(cluster.Namespace)
+	}
+
+	return status, nil
 }
 
-func (h *handler) reconcileAgentEnvVars(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, error) {
+func hashStatusField(field any) (string, error) {
+	hasher := sha256.New224()
+	b, err := json.Marshal(field)
+	if err != nil {
+		return "", err
+	}
+	hasher.Write(b)
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func hashChanged(field any, statusHash string) (bool, string, error) {
+	isNil := func(field any) bool {
+		switch field := field.(type) {
+		case *corev1.Affinity:
+			return field == nil
+		case *corev1.ResourceRequirements:
+			return field == nil
+		case []corev1.Toleration:
+			return len(field) == 0
+		default:
+			return false
+		}
+	}
+
+	if isNil(field) {
+		if statusHash != "" {
+			return true, "", nil
+		}
+		return false, "", nil
+	}
+
+	hash, err := hashStatusField(field)
+	if err != nil {
+		return false, "", err
+	}
+
+	return statusHash != hash, hash, nil
+}
+
+// reconcileAgentEnvVars checks if the agent environment variables field was
+// updated by hashing its contents into a status field.
+func (h *handler) reconcileAgentEnvVars(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, bool, error) {
+	enqueue := false
+
 	if len(cluster.Spec.AgentEnvVars) < 1 {
 		// Remove the existing hash if the environment variables have been deleted.
 		if status.AgentEnvVarsHash != "" {
 			// We enqueue to ensure that we edit the status after other controllers.
-			h.namespaces.Enqueue(cluster.Namespace)
+			enqueue = true
 			status.AgentEnvVarsHash = ""
 		}
-		return status, nil
+		return status, enqueue, nil
 	}
 
-	hasher := sha256.New224()
-	b, err := json.Marshal(cluster.Spec.AgentEnvVars)
+	hash, err := hashStatusField(cluster.Spec.AgentEnvVars)
 	if err != nil {
-		return status, err
+		return status, enqueue, err
 	}
-	hasher.Write(b)
-	hash := fmt.Sprintf("%x", hasher.Sum(nil))
 
 	if status.AgentEnvVarsHash != hash {
 		// We enqueue to ensure that we edit the status after other controllers.
-		h.namespaces.Enqueue(cluster.Namespace)
+		enqueue = true
 		status.AgentEnvVarsHash = hash
 	}
-	return status, nil
+
+	return status, enqueue, nil
+}
+
+func (h *handler) updateClusterStatus(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, bool, error) {
+	changed := false
+
+	if status.AgentPrivateRepoURL != cluster.Spec.PrivateRepoURL {
+		status.AgentPrivateRepoURL = cluster.Spec.PrivateRepoURL
+		changed = true
+	}
+
+	if c, hash, err := hashChanged(cluster.Spec.AgentAffinity, status.AgentAffinityHash); err != nil {
+		return status, changed, err
+	} else if c {
+		status.AgentAffinityHash = hash
+		changed = c
+	}
+
+	if c, hash, err := hashChanged(cluster.Spec.AgentResources, status.AgentResourcesHash); err != nil {
+		return status, changed, err
+	} else if c {
+		status.AgentResourcesHash = hash
+		changed = c
+	}
+
+	if c, hash, err := hashChanged(cluster.Spec.AgentTolerations, status.AgentTolerationsHash); err != nil {
+		return status, changed, err
+	} else if c {
+		status.AgentTolerationsHash = hash
+		changed = c
+	}
+
+	return status, changed, nil
 }
 
 func (h *handler) resolveNS(namespace, _ string, obj runtime.Object) ([]relatedresource.Key, error) {
@@ -105,6 +204,12 @@ func (h *handler) OnNamespace(key string, namespace *corev1.Namespace) (*corev1.
 		return nil, nil
 	}
 
+	cfg := config.Get()
+	// managed agents are disabled, so we don't need to create the bundle
+	if cfg.ManageAgent != nil && !*cfg.ManageAgent {
+		return nil, nil
+	}
+
 	clusters, err := h.clusterCache.List(namespace.Name, labels.Everything())
 	if err != nil {
 		return nil, err
@@ -117,8 +222,10 @@ func (h *handler) OnNamespace(key string, namespace *corev1.Namespace) (*corev1.
 	var objs []runtime.Object
 
 	for _, cluster := range clusters {
-		bundle, err := h.getAgentBundle(namespace.Name, cluster)
+		logrus.Infof("Update agent bundle for cluster %s/%s", cluster.Namespace, cluster.Name)
+		bundle, err := h.newAgentBundle(namespace.Name, cluster)
 		if err != nil {
+			logrus.Errorf("Failed to update agent bundle for cluster %s/%s", cluster.Namespace, cluster.Name)
 			return nil, err
 		}
 		objs = append(objs, bundle)
@@ -131,12 +238,8 @@ func (h *handler) OnNamespace(key string, namespace *corev1.Namespace) (*corev1.
 		ApplyObjects(objs...)
 }
 
-func (h *handler) getAgentBundle(ns string, cluster *fleet.Cluster) (runtime.Object, error) {
+func (h *handler) newAgentBundle(ns string, cluster *fleet.Cluster) (runtime.Object, error) {
 	cfg := config.Get()
-	if cfg.ManageAgent != nil && !*cfg.ManageAgent {
-		return nil, nil
-	}
-
 	agentNamespace := h.systemNamespace
 	if cluster.Spec.AgentNamespace != "" {
 		agentNamespace = cluster.Spec.AgentNamespace
@@ -144,7 +247,21 @@ func (h *handler) getAgentBundle(ns string, cluster *fleet.Cluster) (runtime.Obj
 
 	// Notice we only set the agentScope when it's a non-default agentNamespace. This is for backwards compatibility
 	// for when we didn't have agent scope before
-	objs := agent.Manifest(agentNamespace, cluster.Spec.AgentNamespace, cfg.AgentImage, cfg.AgentImagePullPolicy, "bundle", cfg.AgentCheckinInternal.Duration.String(), cluster.Spec.AgentEnvVars)
+	objs := agent.Manifest(
+		agentNamespace, cluster.Spec.AgentNamespace,
+		agent.ManifestOptions{
+			AgentEnvVars:          cluster.Spec.AgentEnvVars,
+			AgentImage:            cfg.AgentImage,
+			AgentImagePullPolicy:  cfg.AgentImagePullPolicy,
+			AgentTolerations:      cluster.Spec.AgentTolerations,
+			CheckinInterval:       cfg.AgentCheckinInterval.Duration.String(),
+			Generation:            "bundle", // adopted by bundle
+			PrivateRepoURL:        cluster.Spec.PrivateRepoURL,
+			SystemDefaultRegistry: cfg.SystemDefaultRegistry,
+			AgentAffinity:         cluster.Spec.AgentAffinity,
+			AgentResources:        cluster.Spec.AgentResources,
+		},
+	)
 	agentYAML, err := yaml.Export(objs...)
 	if err != nil {
 		return nil, err

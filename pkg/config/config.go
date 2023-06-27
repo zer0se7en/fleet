@@ -1,3 +1,4 @@
+// Package config implements the config for the fleet manager and agent
 package config
 
 import (
@@ -6,7 +7,9 @@ import (
 	"sync"
 
 	"github.com/rancher/fleet/pkg/version"
+
 	corev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,13 +21,15 @@ const (
 	AgentConfigName          = "fleet-agent"
 	AgentBootstrapConfigName = "fleet-agent-bootstrap"
 	Key                      = "config"
-	DefaultNamespace         = "fleet-system"
+	// DefaultNamespace is the default for the system namespace, which
+	// contains the manager and agent
+	DefaultNamespace       = "cattle-fleet-system"
+	LegacyDefaultNamespace = "fleet-system"
 )
 
 var (
-	DefaultManagerImage        = "rancher/fleet" + ":" + version.Version
-	DefaultAgentImage          = "rancher/fleet-agent" + ":" + version.Version
-	DefaultAgentSimulatorImage = "rancher/fleet-agent-simulator" + ":" + version.Version
+	DefaultManagerImage = "rancher/fleet" + ":" + version.Version
+	DefaultAgentImage   = "rancher/fleet-agent" + ":" + version.Version
 
 	config       *Config
 	callbacks    = map[int]func(*Config) error{}
@@ -33,10 +38,21 @@ var (
 )
 
 type Config struct {
-	AgentImage                      string            `json:"agentImage,omitempty"`
-	AgentImagePullPolicy            string            `json:"agentImagePullPolicy,omitempty"`
-	AgentCheckinInternal            metav1.Duration   `json:"agentCheckinInternal,omitempty"`
-	ManageAgent                     *bool             `json:"manageAgent,omitempty"`
+	// AgentImage defaults to rancher/fleet-agent:version if empty, can include a prefixed SystemDefaultRegistry
+	AgentImage           string `json:"agentImage,omitempty"`
+	AgentImagePullPolicy string `json:"agentImagePullPolicy,omitempty"`
+
+	// SystemDefaultRegistry used by Rancher when constructing the
+	// agentImage string, it's in the config so fleet can remove it if a
+	// private repo url prefix is specified on the agent's cluster resource
+	SystemDefaultRegistry string `json:"systemDefaultRegistry,omitempty"`
+
+	// AgentCheckinInterval determines how often agents update their clusters status, defaults to 15m
+	AgentCheckinInterval metav1.Duration `json:"agentCheckinInterval,omitempty"`
+
+	// ManageAgent if present and set to false, no bundles will be created to manage agents
+	ManageAgent *bool `json:"manageAgent,omitempty"`
+
 	Labels                          map[string]string `json:"labels,omitempty"`
 	ClientID                        string            `json:"clientID,omitempty"`
 	APIServerURL                    string            `json:"apiServerURL,omitempty"`
@@ -48,10 +64,13 @@ type Config struct {
 type Bootstrap struct {
 	Namespace      string `json:"namespace,omitempty"`
 	AgentNamespace string `json:"agentNamespace,omitempty"`
-	Repo           string `json:"repo,omitempty"`
-	Secret         string `json:"secret,omitempty"`
-	Paths          string `json:"paths,omitempty"`
-	Branch         string `json:"branch,omitempty"`
+	// Repo to add at install time that will deploy to the local cluster. This allows
+	// one to fully bootstrap fleet, its configuration and all its downstream clusters
+	// in one shot.
+	Repo   string `json:"repo,omitempty"`
+	Secret string `json:"secret,omitempty"` // gitrepo.ClientSecretName for agent from repo
+	Paths  string `json:"paths,omitempty"`
+	Branch string `json:"branch,omitempty"`
 }
 
 func OnChange(ctx context.Context, f func(*Config) error) {
